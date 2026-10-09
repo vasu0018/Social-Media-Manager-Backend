@@ -1,0 +1,5 @@
+# redis-memory-server's postinstall downloads Redis and, if that fails,
+# compiles it. The Nixpacks image has no compiler, so `npm ci` exits 1.
+# The publishing queue should use REDIS_URL (Redis 5+) instead.
+[variables]
+REDISMS_DISABLE_POSTINSTALL = "1"
