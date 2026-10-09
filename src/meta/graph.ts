@@ -99,7 +99,7 @@ function scopesFor(purpose: 'instagram' | 'facebook', includeComments: boolean) 
     if (includeComments) scopes.push('instagram_business_manage_comments')
     return scopes
   }
-  return ['pages_show_list', 'pages_read_engagement', 'pages_manage_posts', 'business_management']
+  return ['pages_show_list', 'pages_read_engagement', 'pages_manage_posts', 'instagram_basic', 'instagram_content_publish', 'business_management']
 }
 
 function expiryDate(epoch?: number) {
@@ -219,6 +219,17 @@ async function publishInstagram(input: PublishInput) {
     if (input.format === 'instagram_feed_video') fields.share_to_feed = 'true'
   }
   if (text && input.format !== 'instagram_story') fields.caption = text
+  const reel = input.format === 'instagram_reel' || input.format === 'instagram_feed_video'
+  if (input.audio && reel && input.kind === 'video') {
+    if (input.instagramLogin) {
+      throw new HttpError(400, 'A trending song can be added when this Instagram account is connected through its Facebook Page. Reconnect the Page, then choose that Instagram account.')
+    }
+    fields.audio_configuration = JSON.stringify({
+      audio_id: input.audio.id,
+      audio_volume: input.audio.audioVolume,
+      video_volume: input.audio.videoVolume,
+    })
+  }
 
   let containerId = ''
   if (input.kind === 'image') {
@@ -332,6 +343,17 @@ export type PublishInput = {
   mime: string
   bytes: Buffer
   publicUrl: string | null
+  audio?: { id: string; audioVolume: number; videoVolume: number } | null
+}
+
+export type InstagramAudio = {
+  id: string
+  title: string
+  artist: string | null
+  durationMs: number | null
+  artworkUrl: string | null
+  previewUrl: string | null
+  type: 'music' | 'original_sound'
 }
 
 async function exchangeInstagram(code: string): Promise<DiscoveredAccount[]> {
@@ -403,6 +425,25 @@ async function exchangeInstagram(code: string): Promise<DiscoveredAccount[]> {
   }]
 }
 
+function audioText(value: unknown) {
+  return typeof value === 'string' && value.trim() ? value.trim() : null
+}
+
+export async function searchInstagramAudio(token: string, igUserId: string, audioType: 'music' | 'original_sound', query: string): Promise<InstagramAudio[]> {
+  const params = new URLSearchParams({ audio_type: audioType, user_id: igUserId })
+  if (query.trim()) params.set('search_query', query.trim().slice(0, 80))
+  const result = await graph<{ audio?: Array<Record<string, unknown>> }>(`/ig_audio?${params.toString()}`, token)
+  return (result.audio ?? []).slice(0, 25).map((item) => ({
+    id: String(item.audio_id ?? ''),
+    title: audioText(item.title) ?? 'Untitled audio',
+    artist: audioText(item.display_artist) ?? audioText(item.ig_username),
+    durationMs: typeof item.duration_in_ms === 'number' ? item.duration_in_ms : null,
+    artworkUrl: audioText(item.cover_artwork_thumbnail_uri) ?? audioText(item.cover_artwork_thumbnail_url) ?? audioText(item.profile_picture_url),
+    previewUrl: audioText(item.download_url) ?? audioText(item.on_platform_audio_preview_link),
+    type: audioType,
+  })).filter((item) => item.id.length > 0)
+}
+
 export const metaProvider = {
   apiVersion: version(),
   configured: metaConfigured,
@@ -471,6 +512,33 @@ export const metaProvider = {
       if (!canCreate(tasks)) reason = 'Your Page role cannot create content.'
       else if (tokenStatus === 'revoked' || tokenStatus === 'expired') reason = 'Reconnect this Page. Access expired or was revoked.'
       else if (!scopes.includes('pages_manage_posts')) reason = 'Page posting permission was not granted.'
+      const ig = page.instagram_business_account
+      if (ig?.id) {
+        const musicScopes = scopes.some((scope) => scope === 'instagram_content_publish' || scope === 'instagram_basic')
+        const igReason = tokenStatus === 'revoked' || tokenStatus === 'expired'
+          ? 'Reconnect this Page. Access expired or was revoked.'
+          : musicScopes
+            ? null
+            : 'Reconnect the Facebook Page and allow Instagram content publishing. That connection is what can attach a song.'
+        accounts.push({
+          platform: 'instagram',
+          externalId: ig.id,
+          pageId: ig.id,
+          name: ig.name || ig.username || page.name,
+          handle: ig.username ? `@${ig.username}` : page.name,
+          pictureUrl: cleanPicture(ig.profile_picture_url),
+          accountType: 'BUSINESS',
+          followers: ig.followers_count ?? 0,
+          scopes,
+          tasks: ['FACEBOOK_LOGIN'],
+          token: page.access_token,
+          tokenExpiresAt: expiryDate(debug.expires_at),
+          dataAccessExpiresAt: expiryDate(debug.data_access_expires_at),
+          tokenStatus,
+          eligible: igReason == null,
+          eligibilityReason: igReason,
+        })
+      }
       accounts.push({
         ...shared,
         platform: 'facebook',
@@ -501,5 +569,8 @@ export const metaProvider = {
   },
   publish(input: PublishInput): Promise<{ externalId: string; warning?: string }> {
     return input.format.startsWith('instagram') ? publishInstagram(input) : publishFacebook(input)
+  },
+  searchAudio(token: string, igUserId: string, audioType: 'music' | 'original_sound', query: string) {
+    return searchInstagramAudio(token, igUserId, audioType, query)
   },
 }

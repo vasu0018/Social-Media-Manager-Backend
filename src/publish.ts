@@ -270,6 +270,11 @@ async function publishClaimed(existing: Loaded) {
     mime: content.media.mime,
     bytes,
     publicUrl,
+    audio: content.audioId ? {
+      id: content.audioId,
+      audioVolume: content.audioVolume,
+      videoVolume: content.videoVolume,
+    } : null,
   })
   await prisma.contentDestination.update({
     where: { id: existing.id },

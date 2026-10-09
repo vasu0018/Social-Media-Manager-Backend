@@ -86,6 +86,11 @@ model Content {
   caption       String               @default("")
   hashtags      String               @default("")
   firstComment  String?
+  audioId       String?
+  audioTitle    String?
+  audioArtist   String?
+  audioVolume   Int                  @default(100)
+  videoVolume   Int                  @default(100)
   format        String
   status        String
   timezone      String               @default("UTC")

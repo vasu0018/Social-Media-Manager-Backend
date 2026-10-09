@@ -99,6 +99,13 @@ function presentContent(item: ContentRecord) {
     caption: item.caption,
     hashtags: item.hashtags,
     firstComment: item.firstComment,
+    audio: item.audioId ? {
+      id: item.audioId,
+      title: item.audioTitle ?? 'Selected song',
+      artist: item.audioArtist,
+      audioVolume: item.audioVolume,
+      videoVolume: item.videoVolume,
+    } : null,
     format,
     type: coarseType(format),
     platforms: platforms.length > 0 ? platforms : [platformFor(format)],
@@ -174,6 +181,13 @@ const contentSchema = z.object({
   caption: z.string().max(5000).default(''),
   hashtags: z.string().max(1000).default(''),
   firstComment: z.string().max(2200).nullable().optional(),
+  audio: z.object({
+    id: z.string().trim().min(1).max(64),
+    title: z.string().trim().min(1).max(200),
+    artist: z.string().trim().max(200).nullable().optional(),
+    audioVolume: z.number().int().min(1).max(100).default(100),
+    videoVolume: z.number().int().min(1).max(100).default(60),
+  }).nullable().optional(),
   format: z.enum(contentFormats).optional(),
   accountId: z.string().nullable().optional(),
   destinations: z.array(destinationSchema).max(6).optional(),
@@ -623,6 +637,25 @@ api.delete('/media/:id', requireSession, async (req, res) => {
   res.json({ ok: true })
 })
 
+api.get('/audio', requireSession, async (req, res) => {
+  const accountId = typeof req.query.accountId === 'string' ? req.query.accountId : ''
+  const type = req.query.type === 'original_sound' ? 'original_sound' : 'music'
+  const query = typeof req.query.q === 'string' ? req.query.q : ''
+  const account = accountId ? await prisma.socialAccount.findUnique({ where: { id: accountId } }) : null
+  if (!account || account.platform !== 'instagram' || !account.connected || !account.tokenCipher) {
+    throw new HttpError(400, 'Choose a connected Instagram account before looking up songs.')
+  }
+  if (account.tasks.includes('INSTAGRAM_LOGIN') && !account.tasks.includes('FACEBOOK_LOGIN')) {
+    return res.json({
+      tracks: [],
+      available: false,
+      reason: 'This Instagram login cannot browse songs. Connect the Facebook Page that owns the account, then choose that Instagram account.',
+    })
+  }
+  const tracks = await socialProvider.searchAudio(decryptSecret(account.tokenCipher), account.externalId, type, query)
+  res.json({ tracks, available: true, reason: null })
+})
+
 api.get('/content', requireSession, async (req, res) => {
   res.json(await listContent(req))
 })
@@ -685,12 +718,27 @@ api.post('/content', requireSession, async (req, res) => {
     }
     if (input.action !== 'draft') assertCanPublish(account, destination.format, input.firstComment ?? null)
   }
+  const songFormats = new Set(['instagram_reel', 'instagram_feed_video'])
+  if (input.audio && !destinations.some((destination) => songFormats.has(destination.format))) {
+    throw new HttpError(400, 'A song from Instagram can be attached to an Instagram Reel. Stories and Facebook posts keep the audio already inside the file.')
+  }
+  if (input.audio) {
+    const instagram = accounts.find((account) => destinations.some((destination) => destination.accountId === account.id && songFormats.has(destination.format)))
+    if (instagram?.tasks.includes('INSTAGRAM_LOGIN') && !instagram.tasks.includes('FACEBOOK_LOGIN')) {
+      throw new HttpError(400, 'This Instagram login cannot attach a catalog song. Connect the Facebook Page that owns the account, then choose that Instagram account.')
+    }
+  }
   const created = await prisma.content.create({
     data: {
       title: input.title,
       caption: input.caption,
       hashtags: input.hashtags,
       firstComment: input.firstComment?.trim() || null,
+      audioId: input.audio?.id ?? null,
+      audioTitle: input.audio?.title ?? null,
+      audioArtist: input.audio?.artist ?? null,
+      audioVolume: input.audio?.audioVolume ?? 100,
+      videoVolume: input.audio?.videoVolume ?? 60,
       format: destinations[0]?.format ?? input.format ?? 'instagram_reel',
       status: input.action === 'publish' ? 'processing' : input.action === 'schedule' ? 'scheduled' : 'draft',
       timezone: input.timezone,
@@ -808,6 +856,11 @@ api.post('/content/:id/duplicate', requireSession, async (req, res) => {
       caption: existing.caption,
       hashtags: existing.hashtags,
       firstComment: existing.firstComment,
+      audioId: existing.audioId,
+      audioTitle: existing.audioTitle,
+      audioArtist: existing.audioArtist,
+      audioVolume: existing.audioVolume,
+      videoVolume: existing.videoVolume,
       format: existing.format,
       status: 'draft',
       timezone: existing.timezone,
@@ -988,6 +1041,11 @@ api.post('/content/:id/repost', requireSession, async (req, res) => {
       caption: existing.caption,
       hashtags: existing.hashtags,
       firstComment: existing.firstComment,
+      audioId: existing.audioId,
+      audioTitle: existing.audioTitle,
+      audioArtist: existing.audioArtist,
+      audioVolume: existing.audioVolume,
+      videoVolume: existing.videoVolume,
       format: existing.format,
       status: 'draft',
       timezone: existing.timezone,
