@@ -17,6 +17,12 @@ export function createApp() {
   }))
   app.use(cookieParser())
   app.use(express.json({ limit: '1mb' }))
+  app.get('/', (_req, res) => {
+    res.json({ ok: true })
+  })
+  app.get('/health', (_req, res) => {
+    res.json({ ok: true })
+  })
   app.use('/api', api)
   app.use((error: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
     if (error instanceof HttpError) return res.status(error.status).json({ error: error.message })

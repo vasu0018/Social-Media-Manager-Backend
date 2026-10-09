@@ -6,6 +6,7 @@ COPY prisma ./prisma
 ENV REDISMS_DISABLE_POSTINSTALL=1
 RUN npm ci
 COPY tsconfig.json ./
+COPY scripts ./scripts
 COPY src ./src
 EXPOSE 4000
 CMD ["npm", "start"]

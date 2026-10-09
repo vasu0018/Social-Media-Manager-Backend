@@ -13,8 +13,16 @@ if (env.CLIENT_ORIGIN.includes('localhost') && (container || !isDevelopment())) 
   console.error('CLIENT_ORIGIN still points at localhost. Sign-in from the public site will be blocked until it matches the frontend URL.')
 }
 
-app.listen(env.PORT, () => {
-  console.log(`Reel Studio API listening on ${env.PORT}`)
+const server = app.listen(env.PORT, '0.0.0.0', () => {
+  console.log(`Reel Studio API listening on 0.0.0.0:${env.PORT}`)
+})
+server.on('error', (error) => {
+  console.error(error instanceof Error ? error.message : error)
+  process.exit(1)
+})
+
+process.on('unhandledRejection', (error) => {
+  console.error(error instanceof Error ? error.message : error)
 })
 
 void bootQueue()

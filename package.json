@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "start": "prisma migrate deploy && tsx src/index.ts",
+    "start": "node scripts/start.mjs",
     "test": "tsx --test test/security.test.ts test/publishing.test.ts",
     "lint": "tsc --noEmit",
     "build": "tsc --noEmit",
