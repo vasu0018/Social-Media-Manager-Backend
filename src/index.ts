@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs'
 import { mkdir } from 'node:fs/promises'
 import { createApp } from './app.js'
 import { env, isDevelopment } from './env.js'
@@ -7,7 +8,8 @@ const app = createApp()
 
 await mkdir('data', { recursive: true })
 
-if (!isDevelopment() && env.CLIENT_ORIGIN.includes('localhost')) {
+const container = existsSync('/.dockerenv') || existsSync('/run/.containerenv')
+if (env.CLIENT_ORIGIN.includes('localhost') && (container || !isDevelopment())) {
   console.error('CLIENT_ORIGIN still points at localhost. Sign-in from the public site will be blocked until it matches the frontend URL.')
 }
 

@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs'
 import { Queue, UnrecoverableError, Worker, type ConnectionOptions } from 'bullmq'
 import { Redis } from 'ioredis'
 import { env, isDevelopment } from './env.js'
@@ -46,9 +47,16 @@ async function redisIsCurrent(url: string) {
   }
 }
 
+function allowEmbeddedRedis() {
+  if (process.env.REDIS_EMBEDDED === '1') return true
+  if (process.env.REDIS_EMBEDDED === '0') return false
+  if (!isDevelopment()) return false
+  return !existsSync('/.dockerenv') && !existsSync('/run/.containerenv')
+}
+
 export async function ensureRedis() {
   if (await redisIsCurrent(env.REDIS_URL)) return env.REDIS_URL
-  if (!isDevelopment()) {
+  if (!allowEmbeddedRedis()) {
     throw new Error(`Redis at ${redisTarget(env.REDIS_URL)} is unreachable or older than version 5. Set REDIS_URL to a Redis 5+ service.`)
   }
   console.log('Configured Redis is unreachable or older than 5. Starting a local Redis for the publishing queue.')
