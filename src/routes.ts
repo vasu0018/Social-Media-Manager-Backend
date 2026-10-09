@@ -291,7 +291,8 @@ api.get('/meta/status', (_req, res) => {
 })
 
 api.get('/auth/config', (_req, res) => {
-  if (!isDevelopment()) return res.json({ demo: null })
+  const local = isDevelopment() && env.CLIENT_ORIGIN.includes('localhost')
+  if (!local) return res.json({ demo: null })
   res.json({ demo: { email: env.ADMIN_EMAIL, password: env.ADMIN_PASSWORD } })
 })
 
@@ -313,7 +314,7 @@ api.post('/auth/login', rateLimit('login', 8, 15 * 60_000), async (req, res) => 
   res.cookie(SESSION_COOKIE, id, {
     httpOnly: true,
     sameSite: 'lax',
-    secure: env.NODE_ENV === 'production',
+    secure: env.NODE_ENV === 'production' || env.CLIENT_ORIGIN.startsWith('https://'),
     path: '/',
     expires: expiresAt,
   })
@@ -323,7 +324,11 @@ api.post('/auth/login', rateLimit('login', 8, 15 * 60_000), async (req, res) => 
 api.post('/auth/logout', async (req, res) => {
   const id = await sessionId(req)
   if (id) await prisma.adminSession.delete({ where: { id } }).catch(() => undefined)
-  res.clearCookie(SESSION_COOKIE, { path: '/' })
+  res.clearCookie(SESSION_COOKIE, {
+    path: '/',
+    sameSite: 'lax',
+    secure: env.NODE_ENV === 'production' || env.CLIENT_ORIGIN.startsWith('https://'),
+  })
   res.json({ ok: true })
 })
 

@@ -24,8 +24,8 @@ function redisTarget(url: string) {
 function redisConnection(url: string, probe = false) {
   const client = new Redis(url, {
     maxRetriesPerRequest: null,
-    connectTimeout: 2000,
-    enableOfflineQueue: !probe,
+    connectTimeout: probe ? 5000 : 10000,
+    lazyConnect: probe,
     retryStrategy: probe ? () => null : (attempt) => Math.min(attempt * 200, 2000),
   })
   client.on('error', (error: Error) => {
@@ -37,10 +37,13 @@ function redisConnection(url: string, probe = false) {
 async function redisIsCurrent(url: string) {
   const probe = redisConnection(url, true)
   try {
+    await probe.connect()
     const info = await probe.info('server')
     const match = /redis_version:(\d+)/.exec(info)
     return Number(match?.[1] ?? 0) >= 5
-  } catch {
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'connection failed'
+    console.error(`Redis probe failed for ${redisTarget(url)}: ${message}`)
     return false
   } finally {
     probe.disconnect()
