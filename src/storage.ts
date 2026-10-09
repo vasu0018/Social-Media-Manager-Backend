@@ -21,7 +21,7 @@ export interface MediaStorage {
 const localRoot = path.resolve(process.cwd(), 'data', 'media')
 
 class LocalStorage implements MediaStorage {
-  async save(key: string, body: Buffer) {
+  async save(key: string, body: Buffer, _mime: string) {
     await mkdir(localRoot, { recursive: true })
     await writeFile(path.join(localRoot, key), body)
   }
