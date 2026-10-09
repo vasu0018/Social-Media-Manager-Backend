@@ -2,4 +2,5 @@
 # compiles it. The Nixpacks image has no compiler, so `npm ci` exits 1.
 # The publishing queue should use REDIS_URL (Redis 5+) instead.
 [variables]
+NIXPACKS_NODE_VERSION = "22"
 REDISMS_DISABLE_POSTINSTALL = "1"
