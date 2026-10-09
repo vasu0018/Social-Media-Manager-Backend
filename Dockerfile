@@ -8,4 +8,4 @@ RUN npm ci
 COPY tsconfig.json ./
 COPY src ./src
 EXPOSE 4000
-CMD ["sh", "-c", "npx prisma migrate deploy && npx tsx src/index.ts"]
+CMD ["npm", "start"]

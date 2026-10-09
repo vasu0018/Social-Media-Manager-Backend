@@ -1,6 +1,6 @@
 import { Queue, UnrecoverableError, Worker, type ConnectionOptions } from 'bullmq'
 import { Redis } from 'ioredis'
-import { env } from './env.js'
+import { env, isDevelopment } from './env.js'
 import { prisma } from './db.js'
 import { deliver, isPermanent, rollupContent } from './publish.js'
 
@@ -11,12 +11,26 @@ let worker: Worker<{ publicationId: string }> | null = null
 let connection: Redis | null = null
 let memoryRedis: { stop: () => Promise<boolean> } | null = null
 
+function redisTarget(url: string) {
+  try {
+    const parsed = new URL(url)
+    return `${parsed.hostname}:${parsed.port || '6379'}`
+  } catch {
+    return 'the configured Redis server'
+  }
+}
+
 function redisConnection(url: string, probe = false) {
-  return new Redis(url, {
+  const client = new Redis(url, {
     maxRetriesPerRequest: null,
     connectTimeout: 2000,
+    enableOfflineQueue: !probe,
     retryStrategy: probe ? () => null : (attempt) => Math.min(attempt * 200, 2000),
   })
+  client.on('error', (error: Error) => {
+    if (!probe) console.error(`Redis: ${error.message}`)
+  })
+  return client
 }
 
 async function redisIsCurrent(url: string) {
@@ -34,7 +48,10 @@ async function redisIsCurrent(url: string) {
 
 export async function ensureRedis() {
   if (await redisIsCurrent(env.REDIS_URL)) return env.REDIS_URL
-  console.log('Configured Redis is older than 5. Starting a compatible Redis for the publishing queue.')
+  if (!isDevelopment()) {
+    throw new Error(`Redis at ${redisTarget(env.REDIS_URL)} is unreachable or older than version 5. Set REDIS_URL to a Redis 5+ service.`)
+  }
+  console.log('Configured Redis is unreachable or older than 5. Starting a local Redis for the publishing queue.')
   const { RedisMemoryServer } = await import('redis-memory-server')
   const memory = new RedisMemoryServer({ instance: { port: 6380 } })
   memoryRedis = memory
@@ -85,9 +102,11 @@ export async function recoverPublications(enqueue: (publicationId: string, runAt
 }
 
 export async function startWorker() {
+  if (queue) return
   const url = await ensureRedis()
-  connection = redisConnection(url)
-  const options = { connection: connection as unknown as ConnectionOptions }
+  const next = redisConnection(url)
+  connection = next
+  const options = { connection: next as unknown as ConnectionOptions }
   queue = new Queue(QUEUE_NAME, options)
   worker = new Worker(QUEUE_NAME, async (job) => {
     try {
@@ -99,6 +118,13 @@ export async function startWorker() {
       throw error
     }
   }, { ...options, concurrency: 2 })
+
+  worker.on('error', (error) => {
+    console.error(`Publishing worker: ${error.message}`)
+  })
+  queue.on('error', (error) => {
+    console.error(`Publishing queue: ${error.message}`)
+  })
 
   worker.on('failed', (job, error) => {
     if (!job) return
@@ -119,5 +145,15 @@ export async function startWorker() {
     })
   })
 
-  await recoverPublications(enqueuePublication)
+  try {
+    await recoverPublications(enqueuePublication)
+  } catch (error) {
+    await worker.close().catch(() => undefined)
+    await queue.close().catch(() => undefined)
+    next.disconnect()
+    worker = null
+    queue = null
+    connection = null
+    throw error
+  }
 }

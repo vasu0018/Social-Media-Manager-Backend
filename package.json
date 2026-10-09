@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "start": "tsx src/index.ts",
+    "start": "prisma migrate deploy && tsx src/index.ts",
     "test": "tsx --test test/security.test.ts test/publishing.test.ts",
     "lint": "tsc --noEmit",
     "build": "tsc --noEmit",
@@ -25,7 +25,9 @@
     "express": "^5.1.0",
     "ioredis": "^6.0.0",
     "multer": "^2.0.2",
+    "prisma": "^6.16.3",
     "redis-memory-server": "^0.17.1",
+    "tsx": "^4.20.5",
     "zod": "^4.1.11"
   },
   "prisma": {
@@ -37,8 +39,6 @@
     "@types/express": "^5.0.3",
     "@types/multer": "^2.0.0",
     "@types/node": "^24.5.2",
-    "prisma": "^6.16.3",
-    "tsx": "^4.20.5",
     "typescript": "^5.9.2"
   }
 }
