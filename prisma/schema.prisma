@@ -1,0 +1,191 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            String         @id @default(cuid())
+  email         String         @unique
+  name          String
+  role          String         @default("admin")
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  sessions      AdminSession[]
+  auditLogs     AuditLog[]
+  notifications Notification[]
+}
+
+model AdminSession {
+  id        String   @id
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+  expiresAt DateTime
+
+  @@index([userId])
+}
+
+model OauthState {
+  id              String   @id
+  sessionId       String
+  purpose         String
+  includeComments Boolean  @default(false)
+  expiresAt       DateTime
+}
+
+model SocialAccount {
+  id                  String               @id @default(cuid())
+  platform            String
+  externalId          String
+  pageId              String
+  name                String
+  handle              String
+  pictureUrl          String?
+  accountType         String?
+  connected           Boolean              @default(true)
+  followers           Int                  @default(0)
+  grantedScopes       String               @default("[]")
+  tasks               String               @default("[]")
+  tokenCipher         String?
+  tokenExpiresAt      DateTime?
+  dataAccessExpiresAt DateTime?
+  tokenStatus         String               @default("unknown")
+  eligible            Boolean              @default(false)
+  eligibilityReason   String?
+  lastSyncedAt        DateTime?
+  createdAt           DateTime             @default(now())
+  updatedAt           DateTime             @updatedAt
+  destinations        ContentDestination[]
+
+  @@unique([platform, externalId])
+  @@index([platform, connected])
+}
+
+model MediaAsset {
+  id         String    @id @default(cuid())
+  name       String
+  mime       String
+  kind       String
+  bytes      Int
+  width      Int?
+  height     Int?
+  durationMs Int?
+  storageKey String
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+  contents   Content[]
+}
+
+model Content {
+  id            String               @id @default(cuid())
+  title         String
+  caption       String               @default("")
+  hashtags      String               @default("")
+  firstComment  String?
+  format        String
+  status        String
+  timezone      String               @default("UTC")
+  scheduledAt   DateTime?
+  publishedAt   DateTime?
+  error         String?
+  mediaId       String?
+  media         MediaAsset?          @relation(fields: [mediaId], references: [id])
+  destinations  ContentDestination[]
+  notifications Notification[]
+  createdAt     DateTime             @default(now())
+  updatedAt     DateTime             @updatedAt
+
+  @@index([status, scheduledAt])
+  @@index([createdAt])
+}
+
+model ContentDestination {
+  id             String                @id @default(cuid())
+  contentId      String
+  content        Content               @relation(fields: [contentId], references: [id], onDelete: Cascade)
+  accountId      String
+  account        SocialAccount         @relation(fields: [accountId], references: [id])
+  platform       String
+  format         String
+  status         String
+  scheduledAt    DateTime?
+  publishedAt    DateTime?
+  externalId     String?
+  permalink      String?
+  errorCode      String?
+  error          String?
+  retryable      Boolean               @default(false)
+  attemptCount   Int                   @default(0)
+  lockedAt       DateTime?
+  responseMeta   String?
+  idempotencyKey String                @unique
+  attempts       PublishingAttempt[]
+  schedule       ScheduledPublication?
+  createdAt      DateTime              @default(now())
+  updatedAt      DateTime              @updatedAt
+
+  @@unique([contentId, accountId, format])
+  @@index([status, scheduledAt])
+  @@index([accountId])
+  @@index([platform])
+}
+
+model ScheduledPublication {
+  id            String             @id @default(cuid())
+  destinationId String             @unique
+  destination   ContentDestination @relation(fields: [destinationId], references: [id], onDelete: Cascade)
+  scheduledAt   DateTime
+  timezone      String
+  status        String
+  createdAt     DateTime           @default(now())
+  updatedAt     DateTime           @updatedAt
+
+  @@index([status, scheduledAt])
+}
+
+model PublishingAttempt {
+  id            String             @id @default(cuid())
+  destinationId String
+  destination   ContentDestination @relation(fields: [destinationId], references: [id], onDelete: Cascade)
+  startedAt     DateTime           @default(now())
+  finishedAt    DateTime?
+  outcome       String
+  errorCode     String?
+  message       String?
+  retryable     Boolean            @default(false)
+
+  @@index([destinationId, startedAt])
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  userId     String?
+  user       User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  action     String
+  entityType String
+  entityId   String
+  detail     String?
+  createdAt  DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@index([createdAt])
+}
+
+model Notification {
+  id        String   @id @default(cuid())
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  contentId String?
+  content   Content? @relation(fields: [contentId], references: [id], onDelete: SetNull)
+  kind      String
+  title     String
+  body      String
+  readAt    DateTime?
+  createdAt DateTime @default(now())
+
+  @@index([readAt, createdAt])
+}
