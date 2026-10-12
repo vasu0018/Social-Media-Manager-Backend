@@ -48,6 +48,7 @@ function walkAtoms(buffer: Buffer, start: number, end: number, visit: (type: str
 
 export function videoPlayback(buffer: Buffer) {
   let videoCodec: string | null = null
+  let audioCodec: string | null = null
   let moovBeforeMdat = false
   let seenMoov = false
   let offset = 0
@@ -72,10 +73,12 @@ export function videoPlayback(buffer: Buffer) {
   walkAtoms(buffer, 0, buffer.length, (type, body) => {
     if (type !== 'stsd' || body.length < 16) return
     const codec = body.toString('ascii', 12, 16)
-    if (['avc1', 'avc3', 'hvc1', 'hev1', 'vp09', 'av01', 'mp4v'].includes(codec)) videoCodec = codec
+    if (['avc1', 'avc3', 'hvc1', 'hev1', 'vp09', 'av01', 'mp4v'].includes(codec) && !videoCodec) videoCodec = codec
+    if (['mp4a', 'ac-3', 'ec-3', 'alac', 'Opus', 'opus', 'samr', 'twos', 'sowt', 'fLaC'].includes(codec) && !audioCodec) audioCodec = codec
   })
-  const browserCodec = videoCodec === 'avc1' || videoCodec === 'avc3'
-  return { videoCodec, moovBeforeMdat, browserReady: browserCodec && moovBeforeMdat }
+  const browserVideo = videoCodec === 'avc1' || videoCodec === 'avc3'
+  const browserAudio = audioCodec == null || audioCodec === 'mp4a'
+  return { videoCodec, audioCodec, moovBeforeMdat, browserReady: browserVideo && browserAudio && moovBeforeMdat }
 }
 
 function videoProbe(buffer: Buffer) {

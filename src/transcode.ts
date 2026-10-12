@@ -45,17 +45,23 @@ export async function prepareBrowserVideo(input: Buffer) {
   if (input.toString('ascii', 4, 8) !== 'ftyp') return input
   const playback = videoPlayback(input)
   if (playback.browserReady) return input
+  const copyVideo = playback.videoCodec === 'avc1' || playback.videoCodec === 'avc3'
+  const keepAudio = playback.audioCodec == null || playback.audioCodec === 'mp4a'
   try {
-    if (playback.videoCodec === 'avc1' || playback.videoCodec === 'avc3') {
+    if (copyVideo && keepAudio) {
       return await withTempVideo(input, (source, target) => [
-        '-y', '-i', source, '-c', 'copy', '-movflags', '+faststart', target,
+        '-y', '-i', source, '-map', '0:v:0',
+        ...(playback.audioCodec ? ['-map', '0:a:0'] : []),
+        '-c', 'copy', '-movflags', '+faststart', target,
       ])
     }
     return await withTempVideo(input, (source, target) => [
-      '-y', '-i', source,
-      '-c:v', 'libx264', '-profile:v', 'high', '-level', '4.1', '-pix_fmt', 'yuv420p',
-      '-preset', 'veryfast', '-crf', '23',
-      '-c:a', 'aac', '-b:a', '128k',
+      '-y', '-i', source, '-map', '0:v:0',
+      ...(playback.audioCodec ? ['-map', '0:a:0'] : []),
+      ...(copyVideo
+        ? ['-c:v', 'copy']
+        : ['-c:v', 'libx264', '-profile:v', 'high', '-level', '4.1', '-pix_fmt', 'yuv420p', '-preset', 'veryfast', '-crf', '23']),
+      ...(playback.audioCodec ? ['-c:a', 'aac', '-b:a', '160k', '-ar', '48000', '-ac', '2'] : []),
       '-movflags', '+faststart',
       target,
     ])
