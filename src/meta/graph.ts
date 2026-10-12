@@ -491,22 +491,58 @@ function audioText(value: unknown) {
 }
 
 export async function searchInstagramAudio(token: string, igUserId: string, audioType: 'music' | 'original_sound', query: string): Promise<InstagramAudio[]> {
-  const params = new URLSearchParams({
-    audio_type: audioType,
-    user_id: igUserId,
-    fields: 'audio_id,title,display_artist,ig_username,duration_in_ms,download_url,cover_artwork_thumbnail_uri,cover_artwork_thumbnail_url,profile_picture_url',
-  })
-  if (query.trim()) params.set('search_query', query.trim().slice(0, 80))
-  const result = await graph<{ audio?: Array<Record<string, unknown>> }>(`/ig_audio?${params.toString()}`, token)
-  return (result.audio ?? []).slice(0, 25).map((item) => ({
-    id: String(item.audio_id ?? ''),
+  const search = query.trim().slice(0, 80)
+  const collected: InstagramAudio[] = []
+  const seen = new Set<string>()
+  let after = ''
+  for (let page = 0; page < 4; page += 1) {
+    const params = new URLSearchParams({
+      audio_type: audioType,
+      user_id: igUserId,
+      fields: 'audio_id,title,display_artist,ig_username,duration_in_ms,download_url,cover_artwork_thumbnail_uri,cover_artwork_thumbnail_url,profile_picture_url',
+    })
+    if (search.length >= 2) params.set('search_query', search)
+    if (after) params.set('after', after)
+    const result = await graph<{ audio?: Array<Record<string, unknown>>; paging?: { cursors?: { after?: string } } }>(`/ig_audio?${params.toString()}`, token)
+    const batch = result.audio ?? []
+    for (const item of batch) {
+      const track = mapAudio(item, audioType)
+      if (!track || seen.has(track.id)) continue
+      seen.add(track.id)
+      collected.push(track)
+    }
+    const next = result.paging?.cursors?.after ?? ''
+    if (!next || next === after || batch.length === 0) break
+    after = next
+  }
+  return search.length >= 2 ? rankAudio(collected, search) : collected
+}
+
+function mapAudio(item: Record<string, unknown>, audioType: 'music' | 'original_sound'): InstagramAudio | null {
+  const id = String(item.audio_id ?? '')
+  if (!id) return null
+  return {
+    id,
     title: audioText(item.title) ?? 'Untitled audio',
     artist: audioText(item.display_artist) ?? audioText(item.ig_username),
     durationMs: typeof item.duration_in_ms === 'number' ? item.duration_in_ms : null,
     artworkUrl: audioText(item.cover_artwork_thumbnail_uri) ?? audioText(item.cover_artwork_thumbnail_url) ?? audioText(item.profile_picture_url),
     previewUrl: audioText(item.download_url),
     type: audioType,
-  })).filter((item) => item.id.length > 0)
+  }
+}
+
+function rankAudio(tracks: InstagramAudio[], query: string) {
+  const needle = query.toLowerCase()
+  const score = (track: InstagramAudio) => {
+    const title = track.title.toLowerCase()
+    const artist = (track.artist ?? '').toLowerCase()
+    if (title === needle || artist === needle) return 0
+    if (title.startsWith(needle) || artist.startsWith(needle)) return 1
+    if (title.includes(needle) || artist.includes(needle)) return 2
+    return 3
+  }
+  return [...tracks].sort((left, right) => score(left) - score(right))
 }
 
 export const metaProvider = {
