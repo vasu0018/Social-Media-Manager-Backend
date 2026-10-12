@@ -11,7 +11,7 @@ export type StoredObject = {
   stream: () => NodeJS.ReadableStream
   size: () => Promise<number>
   openStream: (range?: { start: number; end: number }) => Promise<NodeJS.ReadableStream>
-  publicUrl: (id: string, seconds: number) => Promise<string>
+  publicUrl: (id: string, seconds: number, mime?: string) => Promise<string>
   remove: () => Promise<void>
 }
 
@@ -38,7 +38,7 @@ class LocalStorage implements MediaStorage {
         await access(file)
         return createReadStream(file, range)
       },
-      publicUrl: async (id, seconds) => {
+      publicUrl: async (id, seconds, _mime?: string) => {
         const exp = Math.floor(Date.now() / 1000) + seconds
         const sig = signValue(`${id}.${exp}`)
         return `${env.PUBLIC_BASE_URL}/api/media/public/${id}?exp=${exp}&sig=${sig}`
@@ -72,6 +72,8 @@ class S3Storage implements MediaStorage {
       Key: objectKey(key),
       Body: body,
       ContentType: mime,
+      ContentDisposition: 'inline',
+      CacheControl: 'public, max-age=86400',
     }))
   }
 
@@ -100,9 +102,14 @@ class S3Storage implements MediaStorage {
         if (!result.Body) throw new Error('Stored media is missing')
         return result.Body as NodeJS.ReadableStream
       },
-      publicUrl: (_id, seconds) => getSignedUrl(
+      publicUrl: (_id, seconds, mime?: string) => getSignedUrl(
         this.client,
-        new GetObjectCommand({ Bucket: env.S3_BUCKET, Key: remoteKey }),
+        new GetObjectCommand({
+          Bucket: env.S3_BUCKET,
+          Key: remoteKey,
+          ResponseContentDisposition: 'inline',
+          ...(mime ? { ResponseContentType: mime } : {}),
+        }),
         { expiresIn: seconds },
       ),
       remove: async () => {
@@ -152,7 +159,7 @@ class MirroredStorage implements MediaStorage {
           return remote.openStream(range)
         }
       },
-      publicUrl: (id, seconds) => (remote ? remote.publicUrl(id, seconds) : local.publicUrl(id, seconds)),
+      publicUrl: (id, seconds, mime?: string) => (remote ? remote.publicUrl(id, seconds, mime) : local.publicUrl(id, seconds, mime)),
       remove: async () => {
         await local.remove()
         if (remote) await remote.remove()
@@ -162,10 +169,27 @@ class MirroredStorage implements MediaStorage {
 }
 
 const s3Enabled = Boolean(env.S3_BUCKET && env.S3_ACCESS_KEY_ID && env.S3_SECRET_ACCESS_KEY)
+const localDisk = new LocalStorage()
+const remoteDisk = s3Enabled ? new S3Storage() : null
 
 export const remoteCopyEnabled = s3Enabled
 
-export const storage: MediaStorage = new MirroredStorage(new LocalStorage(), s3Enabled ? new S3Storage() : null)
+export const storage: MediaStorage = new MirroredStorage(localDisk, remoteDisk)
+
+export async function sharedMediaUrl(key: string, mime: string, seconds = 6 * 24 * 60 * 60) {
+  if (!remoteDisk) return null
+  try {
+    await remoteDisk.open(key).size()
+  } catch {
+    try {
+      const bytes = await localDisk.open(key).read()
+      await remoteDisk.save(key, bytes, mime)
+    } catch {
+      return null
+    }
+  }
+  return remoteDisk.open(key).publicUrl(key, seconds, mime)
+}
 
 export function publicBaseIsLocal() {
   try {

@@ -14,7 +14,7 @@ import { assertCanPublish, pageTokenCipher, permalinkFor, rollupContent, taskLis
 import { probeBuffer } from './probe.js'
 import { enqueuePublication, removePublicationJob } from './queue.js'
 import { guardRequest, rateLimit, redact } from './security.js'
-import { storage } from './storage.js'
+import { sharedMediaUrl, storage } from './storage.js'
 
 const SESSION_COOKIE = 'reel_studio_session'
 const WEEK = 7 * 24 * 60 * 60 * 1000
@@ -58,7 +58,9 @@ function signedMediaPath(id: string) {
   return browserPath(`/api/media/public/${id}?exp=${exp}&sig=${sig}`)
 }
 
-function presentMedia(media: MediaAsset) {
+async function presentMedia(media: MediaAsset) {
+  const captureSrc = signedMediaPath(media.id)
+  const shared = await sharedMediaUrl(media.storageKey, media.mime)
   return {
     id: media.id,
     name: media.name,
@@ -68,7 +70,8 @@ function presentMedia(media: MediaAsset) {
     width: media.width,
     height: media.height,
     durationMs: media.durationMs,
-    src: signedMediaPath(media.id),
+    src: shared ?? captureSrc,
+    captureSrc,
     createdAt: media.createdAt.toISOString(),
   }
 }
@@ -103,7 +106,7 @@ function presentDestination(publication: ContentRecord['destinations'][number]) 
   }
 }
 
-function presentContent(item: ContentRecord) {
+async function presentContent(item: ContentRecord) {
   const destinations = item.destinations.map(presentDestination)
   const format = (destinations[0]?.format ?? item.format) as ContentFormat
   const platforms = [...new Set(destinations.map((publication) => publication.platform))]
@@ -131,7 +134,7 @@ function presentContent(item: ContentRecord) {
     publishedAt: item.publishedAt?.toISOString() ?? null,
     accountIds: destinations.map((publication) => publication.accountId),
     mediaId: item.mediaId,
-    thumbnailUrl: item.media ? signedMediaPath(item.media.id) : null,
+    thumbnailUrl: item.media ? (await sharedMediaUrl(item.media.storageKey, item.media.mime)) ?? signedMediaPath(item.media.id) : null,
     error: item.error,
     externalId: destinations.map((publication) => publication.externalId).filter(Boolean).join(', ') || null,
     createdAt: item.createdAt.toISOString(),
@@ -306,7 +309,7 @@ async function listContent(req: Request, statuses?: string[]) {
     prisma.content.count({ where }),
     prisma.content.findMany({ where, include: contentInclude, orderBy: { createdAt: 'desc' }, skip, take: pageSize }),
   ])
-  return { items: items.map(presentContent), page, pageSize, total }
+  return { items: await Promise.all(items.map((item) => presentContent(item))), page, pageSize, total }
 }
 
 export const api = Router()
@@ -620,7 +623,7 @@ api.post('/accounts/:id/refresh', requireSession, async (req, res) => {
 
 api.get('/media', requireSession, async (_req, res) => {
   const media = await prisma.mediaAsset.findMany({ orderBy: { createdAt: 'desc' } })
-  res.json({ media: media.map(presentMedia) })
+  res.json({ media: await Promise.all(media.map((item) => presentMedia(item))) })
 })
 
 api.post(['/media', '/media/upload'], requireSession, rateLimit('upload', 40, 60 * 60_000), upload.single('file'), async (req, res) => {
@@ -646,7 +649,7 @@ api.post(['/media', '/media/upload'], requireSession, rateLimit('upload', 40, 60
   const key = created.id
   await storage.save(key, file.buffer, probe.mime)
   const media = await prisma.mediaAsset.update({ where: { id: created.id }, data: { storageKey: key } })
-  res.status(201).json({ media: presentMedia(media), errors })
+  res.status(201).json({ media: await presentMedia(media), errors })
 })
 
 async function sendStoredMedia(req: Request, res: Response, media: MediaAsset, cache: string) {
@@ -825,7 +828,7 @@ api.get('/content', requireSession, async (req, res) => {
 })
 
 api.get('/content/:id', requireSession, async (req, res) => {
-  res.json({ item: presentContent(await loadContent(String(req.params.id))) })
+  res.json({ item: await presentContent(await loadContent(String(req.params.id))) })
 })
 
 api.post('/content', requireSession, async (req, res) => {
@@ -944,7 +947,7 @@ api.post('/content', requireSession, async (req, res) => {
       await enqueuePublication(publication.id, input.action === 'schedule' ? scheduledAt : new Date())
     }
   }
-  res.status(input.action === 'publish' ? 202 : 201).json({ item: presentContent(item) })
+  res.status(input.action === 'publish' ? 202 : 201).json({ item: await presentContent(item) })
 })
 
 api.patch('/content/:id', requireSession, async (req, res) => {
@@ -1017,7 +1020,7 @@ api.patch('/content/:id', requireSession, async (req, res) => {
     }
   }
   await audit('content.edit', 'Content', item.id, 'Updated draft or scheduled fields without creating a new publication.')
-  res.json({ item: presentContent(await loadContent(item.id)) })
+  res.json({ item: await presentContent(await loadContent(item.id)) })
 })
 
 api.delete('/content/:id', requireSession, async (req, res) => {
@@ -1042,7 +1045,7 @@ api.post('/content/:id/cancel', requireSession, async (req, res) => {
     }
   }
   await rollupContent(item.id)
-  res.json({ item: presentContent(await loadContent(item.id)) })
+  res.json({ item: await presentContent(await loadContent(item.id)) })
 })
 
 api.post('/content/:id/reschedule', requireSession, async (req, res) => {
@@ -1064,7 +1067,7 @@ api.post('/content/:id/reschedule', requireSession, async (req, res) => {
     await enqueuePublication(publication.id, scheduledAt)
   }
   await audit('content.reschedule', 'Content', item.id, scheduledAt.toISOString())
-  res.json({ item: presentContent(await loadContent(item.id)) })
+  res.json({ item: await presentContent(await loadContent(item.id)) })
 })
 
 api.post('/content/:id/retry', requireSession, async (req, res) => {
@@ -1080,7 +1083,7 @@ api.post('/content/:id/retry', requireSession, async (req, res) => {
     await enqueuePublication(publication.id, new Date())
   }
   await rollupContent(item.id)
-  res.status(202).json({ item: presentContent(await loadContent(item.id)) })
+  res.status(202).json({ item: await presentContent(await loadContent(item.id)) })
 })
 
 api.post('/content/:id/duplicate', requireSession, async (req, res) => {
@@ -1116,7 +1119,7 @@ api.post('/content/:id/duplicate', requireSession, async (req, res) => {
       })),
     })
   }
-  res.status(201).json({ item: presentContent(await loadContent(item.id)) })
+  res.status(201).json({ item: await presentContent(await loadContent(item.id)) })
 })
 
 api.get('/notices', requireSession, async (_req, res) => {
@@ -1173,7 +1176,7 @@ api.post('/content/:id/publish', requireSession, async (req, res) => {
   }
   await rollupContent(item.id)
   await audit('content.publish', 'Content', item.id)
-  res.status(202).json({ item: presentContent(await loadContent(item.id)) })
+  res.status(202).json({ item: await presentContent(await loadContent(item.id)) })
 })
 
 api.post('/content/:id/schedule', requireSession, async (req, res) => {
@@ -1198,7 +1201,7 @@ api.post('/content/:id/schedule', requireSession, async (req, res) => {
   }
   await attachSchedules(item.id, scheduledAt, parsed.data.timezone)
   await audit('content.schedule', 'Content', item.id, scheduledAt.toISOString())
-  res.json({ item: presentContent(await loadContent(item.id)) })
+  res.json({ item: await presentContent(await loadContent(item.id)) })
 })
 
 api.patch('/scheduled-publications/:id', requireSession, async (req, res) => {
@@ -1225,7 +1228,7 @@ api.patch('/scheduled-publications/:id', requireSession, async (req, res) => {
   await enqueuePublication(schedule.destinationId, scheduledAt)
   await rollupContent(schedule.destination.contentId)
   await audit('schedule.update', 'ScheduledPublication', schedule.id, scheduledAt.toISOString())
-  res.json({ item: presentContent(await loadContent(schedule.destination.contentId)) })
+  res.json({ item: await presentContent(await loadContent(schedule.destination.contentId)) })
 })
 
 api.delete('/scheduled-publications/:id', requireSession, async (req, res) => {
@@ -1238,7 +1241,7 @@ api.delete('/scheduled-publications/:id', requireSession, async (req, res) => {
   await prisma.scheduledPublication.update({ where: { id: schedule.id }, data: { status: 'cancelled' } })
   await rollupContent(destination.contentId)
   await audit('schedule.cancel', 'ScheduledPublication', schedule.id)
-  res.json({ item: presentContent(await loadContent(destination.contentId)) })
+  res.json({ item: await presentContent(await loadContent(destination.contentId)) })
 })
 
 api.get('/calendar', requireSession, async (req, res) => {
@@ -1250,7 +1253,7 @@ api.get('/publishing-history', requireSession, async (req, res) => {
 })
 
 api.get('/publishing-history/:id', requireSession, async (req, res) => {
-  res.json({ item: presentContent(await loadContent(String(req.params.id))) })
+  res.json({ item: await presentContent(await loadContent(String(req.params.id))) })
 })
 
 api.post('/publishing-history/:id/retry', requireSession, async (req, res) => {
@@ -1267,7 +1270,7 @@ api.post('/publishing-history/:id/retry', requireSession, async (req, res) => {
   }
   await rollupContent(item.id)
   await audit('content.retry', 'Content', item.id, `Retried ${failed.length} destination(s) without a post ID.`)
-  res.status(202).json({ item: presentContent(await loadContent(item.id)) })
+  res.status(202).json({ item: await presentContent(await loadContent(item.id)) })
 })
 
 api.post('/content/:id/repost', requireSession, async (req, res) => {
@@ -1304,5 +1307,5 @@ api.post('/content/:id/repost', requireSession, async (req, res) => {
     })
   }
   await audit('content.repost', 'Content', item.id, `New draft copied from ${existing.id}. The original publication was left unchanged.`)
-  res.status(201).json({ item: presentContent(await loadContent(item.id)) })
+  res.status(201).json({ item: await presentContent(await loadContent(item.id)) })
 })
