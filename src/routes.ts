@@ -12,6 +12,7 @@ import { socialProvider } from './meta/provider.js'
 import { suggestCaption } from './ai/caption.js'
 import { assertCanPublish, pageTokenCipher, permalinkFor, rollupContent, taskList } from './publish.js'
 import { probeBuffer } from './probe.js'
+import { prepareBrowserVideo } from './transcode.js'
 import { enqueuePublication, removePublicationJob } from './queue.js'
 import { guardRequest, rateLimit, redact } from './security.js'
 import { sharedMediaUrl, storage } from './storage.js'
@@ -629,7 +630,11 @@ api.get('/media', requireSession, async (_req, res) => {
 api.post(['/media', '/media/upload'], requireSession, rateLimit('upload', 40, 60 * 60_000), upload.single('file'), async (req, res) => {
   const file = req.file
   if (!file) throw new HttpError(400, 'Choose a file to upload.')
-  const probe = probeBuffer(file.buffer, file.mimetype, file.originalname)
+  const incomingVideo = file.mimetype.startsWith('video/') || /\.(mp4|mov)$/i.test(file.originalname)
+  const body = incomingVideo ? await prepareBrowserVideo(file.buffer) : file.buffer
+  const mime = incomingVideo ? 'video/mp4' : file.mimetype
+  const name = incomingVideo ? file.originalname.replace(/\.mov$/i, '.mp4') : file.originalname
+  const probe = probeBuffer(body, mime, name)
   const format = typeof req.body?.format === 'string' && contentFormats.includes(req.body.format as ContentFormat)
     ? req.body.format as ContentFormat
     : null
@@ -647,7 +652,7 @@ api.post(['/media', '/media/upload'], requireSession, rateLimit('upload', 40, 60
     },
   })
   const key = created.id
-  await storage.save(key, file.buffer, probe.mime)
+  await storage.save(key, body, probe.mime)
   const media = await prisma.mediaAsset.update({ where: { id: created.id }, data: { storageKey: key } })
   res.status(201).json({ media: await presentMedia(media), errors })
 })

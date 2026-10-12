@@ -46,6 +46,38 @@ function walkAtoms(buffer: Buffer, start: number, end: number, visit: (type: str
   }
 }
 
+export function videoPlayback(buffer: Buffer) {
+  let videoCodec: string | null = null
+  let moovBeforeMdat = false
+  let seenMoov = false
+  let offset = 0
+  while (offset + 8 <= buffer.length) {
+    let size = readU32(buffer, offset)
+    const type = buffer.toString('ascii', offset + 4, offset + 8)
+    let header = 8
+    if (size === 1 && offset + 16 <= buffer.length) {
+      size = Number(buffer.readBigUInt64BE(offset + 8))
+      header = 16
+    } else if (size === 0) {
+      size = buffer.length - offset
+    }
+    if (size < header) break
+    if (type === 'moov') seenMoov = true
+    if (type === 'mdat') {
+      moovBeforeMdat = seenMoov
+      break
+    }
+    offset += size
+  }
+  walkAtoms(buffer, 0, buffer.length, (type, body) => {
+    if (type !== 'stsd' || body.length < 16) return
+    const codec = body.toString('ascii', 12, 16)
+    if (['avc1', 'avc3', 'hvc1', 'hev1', 'vp09', 'av01', 'mp4v'].includes(codec)) videoCodec = codec
+  })
+  const browserCodec = videoCodec === 'avc1' || videoCodec === 'avc3'
+  return { videoCodec, moovBeforeMdat, browserReady: browserCodec && moovBeforeMdat }
+}
+
 function videoProbe(buffer: Buffer) {
   let durationMs: number | null = null
   let width: number | null = null
