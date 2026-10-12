@@ -1,7 +1,7 @@
 import { createReadStream } from 'node:fs'
-import { access, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { access, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
-import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3'
+import { DeleteObjectCommand, GetObjectCommand, HeadObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3'
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
 import { env } from './env.js'
 import { signValue } from './crypto.js'
@@ -9,7 +9,8 @@ import { signValue } from './crypto.js'
 export type StoredObject = {
   read: () => Promise<Buffer>
   stream: () => NodeJS.ReadableStream
-  openStream: () => Promise<NodeJS.ReadableStream>
+  size: () => Promise<number>
+  openStream: (range?: { start: number; end: number }) => Promise<NodeJS.ReadableStream>
   publicUrl: (id: string, seconds: number) => Promise<string>
   remove: () => Promise<void>
 }
@@ -32,9 +33,10 @@ class LocalStorage implements MediaStorage {
     return {
       read: () => readFile(file),
       stream: () => createReadStream(file),
-      openStream: async () => {
+      size: async () => (await stat(file)).size,
+      openStream: async (range) => {
         await access(file)
-        return createReadStream(file)
+        return createReadStream(file, range)
       },
       publicUrl: async (id, seconds) => {
         const exp = Math.floor(Date.now() / 1000) + seconds
@@ -85,8 +87,16 @@ class S3Storage implements MediaStorage {
       stream: () => {
         throw new Error('S3 preview is served through a signed URL')
       },
-      openStream: async () => {
-        const result = await this.client.send(new GetObjectCommand({ Bucket: env.S3_BUCKET, Key: remoteKey }))
+      size: async () => {
+        const head = await this.client.send(new HeadObjectCommand({ Bucket: env.S3_BUCKET, Key: remoteKey }))
+        return head.ContentLength ?? 0
+      },
+      openStream: async (range) => {
+        const result = await this.client.send(new GetObjectCommand({
+          Bucket: env.S3_BUCKET,
+          Key: remoteKey,
+          Range: range ? `bytes=${range.start}-${range.end}` : undefined,
+        }))
         if (!result.Body) throw new Error('Stored media is missing')
         return result.Body as NodeJS.ReadableStream
       },
@@ -126,12 +136,20 @@ class MirroredStorage implements MediaStorage {
         }
       },
       stream: () => local.stream(),
-      openStream: async () => {
+      size: async () => {
         try {
-          return await local.openStream()
+          return await local.size()
         } catch (error) {
           if (!remote) throw error
-          return remote.openStream()
+          return remote.size()
+        }
+      },
+      openStream: async (range) => {
+        try {
+          return await local.openStream(range)
+        } catch (error) {
+          if (!remote) throw error
+          return remote.openStream(range)
         }
       },
       publicUrl: (id, seconds) => (remote ? remote.publicUrl(id, seconds) : local.publicUrl(id, seconds)),

@@ -644,10 +644,30 @@ api.post(['/media', '/media/upload'], requireSession, rateLimit('upload', 40, 60
   res.status(201).json({ media: presentMedia(media), errors })
 })
 
-async function sendStoredMedia(res: Response, media: MediaAsset, cache: string) {
+async function sendStoredMedia(req: Request, res: Response, media: MediaAsset, cache: string) {
+  const opened = storage.open(media.storageKey)
+  const size = await opened.size()
   res.setHeader('Content-Type', media.mime)
+  res.setHeader('Accept-Ranges', 'bytes')
   res.setHeader('Cache-Control', cache)
-  const stream = await storage.open(media.storageKey).openStream()
+  const requested = typeof req.headers.range === 'string' ? /bytes=(\d*)-(\d*)/.exec(req.headers.range) : null
+  let range: { start: number; end: number } | undefined
+  if (requested && size > 0) {
+    const start = requested[1] ? Number(requested[1]) : 0
+    const end = requested[2] ? Number(requested[2]) : size - 1
+    if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end >= size || start > end) {
+      res.status(416).setHeader('Content-Range', `bytes */${size}`)
+      res.end()
+      return
+    }
+    range = { start, end }
+    res.status(206)
+    res.setHeader('Content-Range', `bytes ${start}-${end}/${size}`)
+    res.setHeader('Content-Length', String(end - start + 1))
+  } else {
+    res.setHeader('Content-Length', String(size))
+  }
+  const stream = await opened.openStream(range)
   stream.on('error', () => {
     if (!res.headersSent) res.status(404).end()
     else res.destroy()
@@ -658,7 +678,7 @@ async function sendStoredMedia(res: Response, media: MediaAsset, cache: string) 
 api.get('/media/:id/preview', requireSession, async (req, res) => {
   const media = await prisma.mediaAsset.findUnique({ where: { id: String(req.params.id) } })
   if (!media) throw new HttpError(404, 'Media not found.')
-  await sendStoredMedia(res, media, 'private, max-age=3600')
+  await sendStoredMedia(req, res, media, 'private, max-age=3600')
 })
 
 api.get('/media/public/:id', async (req, res) => {
@@ -670,7 +690,7 @@ api.get('/media/public/:id', async (req, res) => {
   }
   const media = await prisma.mediaAsset.findUnique({ where: { id } })
   if (!media) throw new HttpError(404, 'Media not found.')
-  await sendStoredMedia(res, media, 'public, max-age=300')
+  await sendStoredMedia(req, res, media, 'public, max-age=300')
 })
 
 api.delete('/media/:id', requireSession, async (req, res) => {
