@@ -117,6 +117,9 @@ export function probeBuffer(buffer: Buffer, mime: string, name: string): Probe {
   const lower = name.toLowerCase()
   const isJpeg = mime === 'image/jpeg' || lower.endsWith('.jpg') || lower.endsWith('.jpeg')
   const isPng = mime === 'image/png' || lower.endsWith('.png')
+  const isWebp = mime === 'image/webp' || lower.endsWith('.webp')
+  const isGif = mime === 'image/gif' || lower.endsWith('.gif')
+  const isBmp = mime === 'image/bmp' || lower.endsWith('.bmp')
   const isVideo = mime.startsWith('video/') || lower.endsWith('.mp4') || lower.endsWith('.mov')
   if (isJpeg) {
     if (buffer[0] !== 0xff || buffer[1] !== 0xd8) throw new HttpError(400, 'This file is not a JPEG image.')
@@ -129,11 +132,23 @@ export function probeBuffer(buffer: Buffer, mime: string, name: string): Probe {
     const size = pngSize(buffer)
     return { mime: 'image/png', kind: 'image', width: size.width, height: size.height, durationMs: null, bytes: buffer.length }
   }
+  if (isGif) {
+    if (buffer.toString('ascii', 0, 3) !== 'GIF') throw new HttpError(400, 'This file is not a GIF image.')
+    return { mime: 'image/gif', kind: 'image', width: buffer.readUInt16LE(6), height: buffer.readUInt16LE(8), durationMs: null, bytes: buffer.length }
+  }
+  if (isWebp) {
+    if (buffer.toString('ascii', 0, 4) !== 'RIFF' || buffer.toString('ascii', 8, 12) !== 'WEBP') throw new HttpError(400, 'This file is not a WebP image.')
+    return { mime: 'image/webp', kind: 'image', width: null, height: null, durationMs: null, bytes: buffer.length }
+  }
+  if (isBmp) {
+    if (buffer.toString('ascii', 0, 2) !== 'BM') throw new HttpError(400, 'This file is not a BMP image.')
+    return { mime: 'image/bmp', kind: 'image', width: buffer.readInt32LE(18), height: Math.abs(buffer.readInt32LE(22)), durationMs: null, bytes: buffer.length }
+  }
   if (isVideo) {
     if (buffer.toString('ascii', 4, 8) !== 'ftyp') throw new HttpError(400, 'This file is not an MP4 or MOV video.')
     const details = videoProbe(buffer)
     const videoMime = lower.endsWith('.mov') || mime === 'video/quicktime' ? 'video/quicktime' : 'video/mp4'
     return { mime: videoMime, kind: 'video', width: details.width, height: details.height, durationMs: details.durationMs, bytes: buffer.length }
   }
-  throw new HttpError(400, 'Upload a JPEG, PNG, MP4, or MOV file.')
+  throw new HttpError(400, 'Upload a JPEG, PNG, WebP, GIF, MP4, or MOV file.')
 }

@@ -2,6 +2,7 @@ export class HttpError extends Error {
   constructor(
     public status: number,
     message: string,
+    public code?: string,
   ) {
     super(message)
   }
@@ -99,12 +100,12 @@ export const mediaRules: Record<ContentFormat, MediaRule> = {
   instagram_story: {
     label: 'Instagram Story',
     kinds: ['image', 'video'],
-    mimes: ['image/jpeg', 'video/mp4', 'video/quicktime'],
+    mimes: ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/bmp', 'video/mp4', 'video/quicktime'],
     maxBytes: mb(100),
     minDurationMs: 3000,
     maxDurationMs: 60_000,
     maxWidth: 1920,
-    note: 'Stories publish only to Instagram Business accounts. Video is 3 to 60 seconds. 9:16 is recommended.',
+    note: 'Stories publish only to Instagram Business accounts. Photos can be JPEG, PNG, WebP, or GIF. Video is 3 to 60 seconds. 9:16 is recommended.',
   },
   facebook_image: {
     label: 'Facebook image post',
@@ -139,7 +140,7 @@ export const mediaRules: Record<ContentFormat, MediaRule> = {
   facebook_story: {
     label: 'Facebook Story',
     kinds: ['image', 'video'],
-    mimes: ['image/jpeg', 'image/png', 'video/mp4', 'video/quicktime'],
+    mimes: ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/bmp', 'video/mp4', 'video/quicktime'],
     maxBytes: mb(100),
     minDurationMs: 3000,
     maxDurationMs: 60_000,

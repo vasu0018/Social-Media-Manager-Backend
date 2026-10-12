@@ -41,29 +41,75 @@ function version() {
   return env.META_GRAPH_VERSION || 'v26.0'
 }
 
-export function classifyMetaError(status: number, message: string) {
-  if (message.includes('revoked') || message.includes('session has expired')) return new HttpError(401, message)
-  if (status === 429 || /request limit|too many calls|temporarily unavailable/i.test(message)) return new HttpError(429, message)
-  if (status >= 400 && status < 500) return new HttpError(status, message)
-  return new HttpError(503, message)
+export function classifyMetaError(status: number, message: string, code?: string) {
+  if (message.includes('revoked') || message.includes('session has expired')) return new HttpError(401, message, code)
+  if (status === 429 || /request limit|too many calls|temporarily unavailable/i.test(message)) return new HttpError(429, message, code)
+  if (status >= 400 && status < 500) return new HttpError(status, message, code)
+  return new HttpError(503, message, code)
+}
+
+const reelSpecs = 'Instagram Reel specs: MP4 with H.264 video (max 25 Mbps, max 60 fps, 8-bit 4:2:0 colour, no HDR) and AAC audio (max 128 kbps, 48 kHz), vertical 9:16.'
+
+const instagramErrors: Record<string, string> = {
+  '2207001': 'Instagram had a server error while processing this media. Publish again in a few minutes.',
+  '2207003': 'Instagram took too long to download this media. Publish again; if it keeps failing, upload a smaller file.',
+  '2207004': 'This image is larger than Instagram allows (8 MB). Upload a smaller image.',
+  '2207005': 'Instagram does not accept this image format. Upload a JPEG photo.',
+  '2207008': 'The Instagram upload expired before it was published. Publish again.',
+  '2207009': 'Instagram does not accept this aspect ratio. Feed photos must be between 4:5 and 1.91:1; Reels and Stories should be 9:16.',
+  '2207010': 'The caption is longer than Instagram allows (2,200 characters).',
+  '2207020': 'The Instagram upload expired before it was published. Publish again.',
+  '2207026': `Instagram does not accept this video file. ${reelSpecs} Export the video again and re-upload it.`,
+  '2207042': 'This Instagram account reached the daily publishing limit set by Instagram. Try again after 24 hours.',
+  '2207050': 'Instagram has restricted this account. Open the Instagram app and check the account status.',
+  '2207051': 'Instagram blocked this post as possible spam or a policy issue. Change the caption or media and try again.',
+  '2207052': 'Instagram could not download the media from the storage link. Check that the S3 bucket is reachable from the internet, then publish again.',
+  '2207053': 'Instagram hit an unknown error while uploading the video. Publish again.',
+  '2207057': 'The cover frame time is outside the video. Pick a cover frame inside the video, then publish again.',
+  '2207077': `Instagram downloaded the video but could not process it. This happens when the file breaks the ${reelSpecs} It also happens when Instagram does not allow the chosen song on this account, or when Instagram's video processing fails for a while. Publish again; if it fails again, remove the song or re-export the video.`,
+}
+
+export const transientInstagramErrors = new Set(['2207001', '2207003', '2207053', '2207077'])
+
+export function instagramErrorText(code: string) {
+  return instagramErrors[code] ?? null
 }
 
 function scrub(value: string) {
   return redact(value).slice(0, 500)
 }
 
+type MetaErrorBody = { error?: { message?: string; code?: number; error_subcode?: number; error_user_msg?: string } }
+
+function errorText(parsed: MetaErrorBody) {
+  const message = parsed.error?.message ?? 'Meta rejected the request.'
+  if (parsed.error?.code === 190) return 'The connection was revoked. Reconnect the account.'
+  if (/validating client secret/i.test(message)) {
+    return 'The app secret does not match this Meta app. Paste the Facebook App secret into META_APP_SECRET, then restart the API.'
+  }
+  const subcode = parsed.error?.error_subcode ? String(parsed.error.error_subcode) : null
+  const known = subcode ? instagramErrorText(subcode) : null
+  if (known) return known
+  return scrub(parsed.error?.error_user_msg || message)
+}
+
 async function readError(response: Response) {
   const body = await response.text()
   try {
-    const parsed = JSON.parse(body) as { error?: { message?: string; code?: number } }
-    const message = parsed.error?.message ?? 'Meta rejected the request.'
-    if (parsed.error?.code === 190) return 'The connection was revoked. Reconnect the account.'
-    if (/validating client secret/i.test(message)) {
-      return 'The app secret does not match this Meta app. Paste the Facebook App secret into META_APP_SECRET, then restart the API.'
-    }
-    return scrub(message)
+    return errorText(JSON.parse(body) as MetaErrorBody)
   } catch {
     return 'Meta rejected the request.'
+  }
+}
+
+async function readFailure(response: Response) {
+  const body = await response.text()
+  try {
+    const parsed = JSON.parse(body) as MetaErrorBody
+    const code = parsed.error?.error_subcode ?? parsed.error?.code
+    return classifyMetaError(response.status, errorText(parsed), code ? String(code) : undefined)
+  } catch {
+    return classifyMetaError(response.status, 'Meta rejected the request.')
   }
 }
 
@@ -77,7 +123,7 @@ async function graph<T>(pathname: string, token: string, init?: { method?: strin
     },
     body: init?.body,
   })
-  if (!response.ok) throw classifyMetaError(response.status, await readError(response))
+  if (!response.ok) throw await readFailure(response)
   return response.json() as Promise<T>
 }
 
@@ -166,7 +212,7 @@ async function readPages(url: string, token: string) {
   let next: string | null = url
   while (next && pages.length < 100) {
     const response = await fetch(next, { headers: { Authorization: `Bearer ${token}` } })
-    if (!response.ok) throw classifyMetaError(response.status, await readError(response))
+    if (!response.ok) throw await readFailure(response)
     const data = await response.json() as { data?: PageNode[]; paging?: { next?: string } }
     pages.push(...(data.data ?? []))
     next = data.paging?.next ?? null
@@ -238,8 +284,14 @@ async function waitForContainer(id: string, token: string, host?: string) {
   for (let attempt = 0; attempt < 90; attempt += 1) {
     const status = await graph<{ status_code?: string; status?: string }>(`/${id}?fields=status_code,status`, token, { host })
     if (status.status_code === 'FINISHED') return
-    if (status.status_code === 'ERROR' || status.status_code === 'EXPIRED') {
-      throw new HttpError(400, status.status || 'Instagram could not process this media.')
+    if (status.status_code === 'EXPIRED') {
+      throw new HttpError(400, instagramErrors['2207020'] ?? 'The Instagram upload expired. Publish again.', 'EXPIRED')
+    }
+    if (status.status_code === 'ERROR') {
+      const code = status.status?.match(/error code (\d+)/i)?.[1]
+      const known = code ? instagramErrorText(code) : null
+      const raw = status.status ? scrub(status.status) : 'Instagram could not process this media.'
+      throw new HttpError(400, known ?? raw, code ?? 'ERROR')
     }
     await sleep(4000)
   }
@@ -266,7 +318,7 @@ async function uploadInstagramVideo(containerId: string, token: string, bytes: B
     },
     body: new Uint8Array(bytes),
   })
-  if (!response.ok) throw classifyMetaError(response.status, await readError(response))
+  if (!response.ok) throw await readFailure(response)
 }
 
 async function publishInstagram(input: PublishInput) {
@@ -296,29 +348,35 @@ async function publishInstagram(input: PublishInput) {
     fields.thumb_offset = String(Math.round(input.thumbOffsetMs))
   }
 
-  let containerId = ''
   if (input.kind === 'image') {
     if (!input.publicUrl) {
       throw new HttpError(400, 'Instagram image publishing needs a public HTTPS media URL. Set PUBLIC_BASE_URL to an address Meta can reach, or configure private S3 storage.')
     }
     fields.image_url = input.publicUrl
-    const container = await graph<{ id: string }>(`/${input.igId}/media`, input.token, { method: 'POST', body: form(fields), host })
-    containerId = container.id
   } else if (input.audio && reel) {
     if (!input.publicUrl?.startsWith('https://')) {
       throw new HttpError(400, 'Instagram attaches a catalog song only when it downloads the video from a public HTTPS address. Set PUBLIC_BASE_URL to an address Meta can reach.')
     }
     fields.video_url = input.publicUrl
-    const container = await graph<{ id: string }>(`/${input.igId}/media`, input.token, { method: 'POST', body: form(fields), host })
-    containerId = container.id
   } else {
     fields.upload_type = 'resumable'
-    const container = await graph<{ id: string }>(`/${input.igId}/media`, input.token, { method: 'POST', body: form(fields), host })
-    containerId = container.id
-    await uploadInstagramVideo(container.id, input.token, input.bytes)
   }
 
-  await waitForContainer(containerId, input.token, host)
+  const createContainer = async () => {
+    const container = await graph<{ id: string }>(`/${input.igId}/media`, input.token, { method: 'POST', body: form(fields), host })
+    if (fields.upload_type === 'resumable') await uploadInstagramVideo(container.id, input.token, input.bytes)
+    await waitForContainer(container.id, input.token, host)
+    return container.id
+  }
+
+  let containerId = ''
+  try {
+    containerId = await createContainer()
+  } catch (error) {
+    if (!(error instanceof HttpError) || !error.code || !transientInstagramErrors.has(error.code)) throw error
+    await sleep(15000)
+    containerId = await createContainer()
+  }
   const published = await graph<{ id: string }>(`/${input.igId}/media_publish`, input.token, {
     method: 'POST',
     body: form({ creation_id: containerId }),
@@ -345,7 +403,7 @@ async function uploadFacebookBinary(uploadUrl: string, token: string, bytes: Buf
     },
     body: new Uint8Array(bytes),
   })
-  if (!response.ok) throw classifyMetaError(response.status, await readError(response))
+  if (!response.ok) throw await readFailure(response)
 }
 
 async function publishFacebook(input: PublishInput) {

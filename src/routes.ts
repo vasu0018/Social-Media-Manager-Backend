@@ -8,11 +8,12 @@ import { decryptSecret, encryptSecret, randomId, signaturesMatch, signValue } fr
 import { prisma } from './db.js'
 import { coarseType, contentFormats, HttpError, platformFor, validateProbe, type ContentFormat } from './domain.js'
 import { env, instagramConfigured, isDevelopment, metaConfigured } from './env.js'
+import { instagramErrorText } from './meta/graph.js'
 import { socialProvider } from './meta/provider.js'
 import { suggestCaption } from './ai/caption.js'
 import { assertCanPublish, pageTokenCipher, permalinkFor, rollupContent, taskList } from './publish.js'
 import { probeBuffer } from './probe.js'
-import { prepareBrowserVideo } from './transcode.js'
+import { prepareStoryImage, prepareVideo } from './transcode.js'
 import { enqueuePublication, removePublicationJob } from './queue.js'
 import { guardRequest, rateLimit, redact } from './security.js'
 import { sharedMediaUrl, storage } from './storage.js'
@@ -88,6 +89,8 @@ const contentInclude = {
 type ContentRecord = Prisma.ContentGetPayload<{ include: typeof contentInclude }>
 
 function presentDestination(publication: ContentRecord['destinations'][number]) {
+  const metaCode = publication.error?.match(/failed with error code (\d+)/i)?.[1] ?? null
+  const explained = metaCode ? instagramErrorText(metaCode) : null
   return {
     id: publication.id,
     scheduleId: publication.schedule?.id ?? null,
@@ -100,8 +103,8 @@ function presentDestination(publication: ContentRecord['destinations'][number]) 
     publishedAt: publication.publishedAt?.toISOString() ?? null,
     externalId: publication.externalId,
     permalink: publication.permalink,
-    errorCode: publication.errorCode,
-    error: publication.error,
+    errorCode: explained ? metaCode : publication.errorCode,
+    error: explained ?? publication.error,
     retryable: publication.retryable,
     attemptCount: publication.attemptCount,
   }
@@ -630,14 +633,25 @@ api.get('/media', requireSession, async (_req, res) => {
 api.post(['/media', '/media/upload'], requireSession, rateLimit('upload', 40, 60 * 60_000), upload.single('file'), async (req, res) => {
   const file = req.file
   if (!file) throw new HttpError(400, 'Choose a file to upload.')
-  const incomingVideo = file.mimetype.startsWith('video/') || /\.(mp4|mov)$/i.test(file.originalname)
-  const body = incomingVideo ? await prepareBrowserVideo(file.buffer) : file.buffer
-  const mime = incomingVideo ? 'video/mp4' : file.mimetype
-  const name = incomingVideo ? file.originalname.replace(/\.mov$/i, '.mp4') : file.originalname
-  const probe = probeBuffer(body, mime, name)
   const format = typeof req.body?.format === 'string' && contentFormats.includes(req.body.format as ContentFormat)
     ? req.body.format as ContentFormat
     : null
+  const incomingVideo = file.mimetype.startsWith('video/') || /\.(mp4|mov)$/i.test(file.originalname)
+  const incomingImage = file.mimetype.startsWith('image/') || /\.(jpe?g|png|webp|gif|bmp)$/i.test(file.originalname)
+  let body = file.buffer
+  let mime = file.mimetype
+  let name = file.originalname
+  if (incomingVideo) {
+    body = (await prepareVideo(file.buffer)).body
+    mime = 'video/mp4'
+    name = file.originalname.replace(/\.mov$/i, '.mp4')
+  } else if (incomingImage && (format?.endsWith('story') || (file.mimetype !== 'image/jpeg' && file.mimetype !== 'image/png'))) {
+    const prepared = await prepareStoryImage(file.buffer, file.mimetype || 'image/jpeg')
+    body = prepared.body
+    mime = prepared.mime
+    name = file.originalname.replace(/\.[^.]+$/, '.jpg')
+  }
+  const probe = probeBuffer(body, mime, name)
   const errors = format ? validateProbe(format, probe) : []
   const created = await prisma.mediaAsset.create({
     data: {
@@ -781,7 +795,10 @@ async function catalogAccess(account: SocialAccount) {
 }
 
 function allowedAudioHost(hostname: string) {
-  return hostname === 'fbcdn.net' || hostname.endsWith('.fbcdn.net') || hostname === 'cdninstagram.com' || hostname.endsWith('.cdninstagram.com')
+  return hostname === 'fbcdn.net' || hostname.endsWith('.fbcdn.net')
+    || hostname === 'cdninstagram.com' || hostname.endsWith('.cdninstagram.com')
+    || hostname === 'fbsbx.com' || hostname.endsWith('.fbsbx.com')
+    || hostname === 'instagram.com' || hostname.endsWith('.instagram.com')
 }
 
 function audioFilePath(remote: string | null) {
@@ -812,18 +829,23 @@ api.get('/audio/file', async (req, res) => {
     throw new HttpError(400, 'This song has no preview.')
   }
   if (url.protocol !== 'https:' || !allowedAudioHost(url.hostname)) throw new HttpError(400, 'This song has no preview.')
-  const upstream = await fetch(url)
-  if (!upstream.ok) throw new HttpError(502, 'Instagram did not return this preview.')
-  res.status(200)
+  const headers: Record<string, string> = {}
+  if (typeof req.headers.range === 'string') headers.Range = req.headers.range
+  const upstream = await fetch(url, { headers })
+  if (!upstream.ok && upstream.status !== 206) throw new HttpError(502, 'Instagram did not return this preview.')
+  res.status(upstream.status === 206 ? 206 : 200)
   const type = upstream.headers.get('content-type')
   if (type) res.setHeader('Content-Type', type)
+  const range = upstream.headers.get('content-range')
+  if (range) res.setHeader('Content-Range', range)
+  res.setHeader('Accept-Ranges', 'bytes')
   res.setHeader('Cache-Control', 'private, max-age=300')
   res.send(Buffer.from(await upstream.arrayBuffer()))
 })
 
 api.get('/audio', requireSession, async (req, res) => {
   const accountId = typeof req.query.accountId === 'string' ? req.query.accountId : ''
-  const type = req.query.type === 'original_sound' ? 'original_sound' : 'music'
+  const type = 'music'
   const query = typeof req.query.q === 'string' ? req.query.q : ''
   const account = accountId ? await prisma.socialAccount.findUnique({ where: { id: accountId } }) : null
   if (!account || account.platform !== 'instagram' || !account.connected || !account.tokenCipher) {

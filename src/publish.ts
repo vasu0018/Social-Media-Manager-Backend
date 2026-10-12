@@ -3,10 +3,11 @@ import { prisma } from './db.js'
 import { HttpError, platformFor, validateProbe, type ContentFormat } from './domain.js'
 import { socialProvider } from './meta/provider.js'
 import { publicBaseIsLocal, remoteCopyEnabled, storage } from './storage.js'
+import { prepareVideo } from './transcode.js'
 
 export class PermanentPublishError extends HttpError {
-  constructor(status: number, message: string) {
-    super(status, message)
+  constructor(status: number, message: string, code?: string) {
+    super(status, message, code)
     this.name = 'PermanentPublishError'
   }
 }
@@ -219,7 +220,7 @@ export async function deliver(publicationId: string) {
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Publishing failed before Meta accepted the content.'
     const retryable = !isPermanent(error)
-    const errorCode = error instanceof HttpError ? String(error.status) : 'publish_failed'
+    const errorCode = error instanceof HttpError ? error.code ?? String(error.status) : 'publish_failed'
     await prisma.publishingAttempt.create({
       data: {
         destinationId: publicationId,
@@ -253,7 +254,16 @@ async function publishClaimed(existing: Loaded) {
   const format = existing.format as ContentFormat
   assertCanPublish(account, format, content.firstComment)
   await assertRateLimit(account.id, format)
-  const bytes = await storage.open(content.media.storageKey).read()
+  let bytes = await storage.open(content.media.storageKey).read()
+  if (content.media.kind === 'video' && format.startsWith('instagram')) {
+    const prepared = await prepareVideo(bytes)
+    if (prepared.changed) {
+      bytes = prepared.body
+      await storage.save(content.media.storageKey, bytes, 'video/mp4')
+      await prisma.mediaAsset.update({ where: { id: content.media.id }, data: { bytes: bytes.length, mime: 'video/mp4' } })
+      content.media.mime = 'video/mp4'
+    }
+  }
   const errors = validateProbe(format, {
     mime: content.media.mime,
     kind: content.media.kind as 'image' | 'video',
