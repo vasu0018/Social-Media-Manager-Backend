@@ -9,7 +9,7 @@ import { prisma } from './db.js'
 import { coarseType, contentFormats, HttpError, platformFor, validateProbe, type ContentFormat } from './domain.js'
 import { env, instagramConfigured, isDevelopment, metaConfigured } from './env.js'
 import { socialProvider } from './meta/provider.js'
-import { assertCanPublish, permalinkFor, rollupContent } from './publish.js'
+import { assertCanPublish, pageTokenCipher, permalinkFor, rollupContent, taskList } from './publish.js'
 import { probeBuffer } from './probe.js'
 import { enqueuePublication, removePublicationJob } from './queue.js'
 import { guardRequest, rateLimit, redact } from './security.js'
@@ -38,10 +38,23 @@ function presentAccount(account: SocialAccount) {
     eligible: account.connected && account.eligible,
     eligibilityReason: account.eligibilityReason,
     grantedScopes: JSON.parse(account.grantedScopes) as string[],
+    canBrowseSongs: Boolean(pageTokenCipher(account)),
     tokenExpiresAt: account.tokenExpiresAt?.toISOString() ?? null,
     dataAccessExpiresAt: account.dataAccessExpiresAt?.toISOString() ?? null,
     lastSyncedAt: account.lastSyncedAt?.toISOString() ?? null,
   }
+}
+
+function browserPath(path: string) {
+  const base = env.PUBLIC_BASE_URL.replace(/\/$/, '')
+  if (env.NODE_ENV === 'production' && base.startsWith('https://')) return `${base}${path}`
+  return path
+}
+
+function signedMediaPath(id: string) {
+  const exp = Math.floor(Date.now() / 1000) + 12 * 60 * 60
+  const sig = signValue(`${id}.${exp}`)
+  return browserPath(`/api/media/public/${id}?exp=${exp}&sig=${sig}`)
 }
 
 function presentMedia(media: MediaAsset) {
@@ -54,7 +67,7 @@ function presentMedia(media: MediaAsset) {
     width: media.width,
     height: media.height,
     durationMs: media.durationMs,
-    src: `/api/media/${media.id}/preview`,
+    src: signedMediaPath(media.id),
     createdAt: media.createdAt.toISOString(),
   }
 }
@@ -115,7 +128,7 @@ function presentContent(item: ContentRecord) {
     publishedAt: item.publishedAt?.toISOString() ?? null,
     accountIds: destinations.map((publication) => publication.accountId),
     mediaId: item.mediaId,
-    thumbnailUrl: item.media ? `/api/media/${item.media.id}/preview` : null,
+    thumbnailUrl: item.media ? signedMediaPath(item.media.id) : null,
     error: item.error,
     externalId: destinations.map((publication) => publication.externalId).filter(Boolean).join(', ') || null,
     createdAt: item.createdAt.toISOString(),
@@ -159,8 +172,14 @@ async function requireSession(req: Request, res: Response, next: NextFunction) {
   next()
 }
 
-function redirectClient(res: Response, query: Record<string, string>) {
-  const target = new URL('/accounts', env.CLIENT_ORIGIN)
+function safeReturn(value: unknown) {
+  if (value === '/accounts' || value === '/settings' || value === '/create' || value === '/stories/compose') return value
+  if (typeof value === 'string' && /^\/create\?kind=(reel|story|image|video)$/.test(value)) return value
+  return ''
+}
+
+function redirectClient(res: Response, query: Record<string, string>, returnTo = '') {
+  const target = new URL(safeReturn(returnTo) || '/accounts', env.CLIENT_ORIGIN)
   for (const [key, value] of Object.entries(query)) target.searchParams.set(key, value)
   res.redirect(target.toString())
 }
@@ -300,6 +319,7 @@ api.get('/meta/status', (_req, res) => {
     instagram: instagramConfigured,
     facebook: metaConfigured,
     apiVersion: socialProvider.apiVersion,
+    redirectUri: env.META_REDIRECT_URI,
     required: ['META_APP_ID', 'META_APP_SECRET', 'META_REDIRECT_URI'],
   })
 })
@@ -362,6 +382,7 @@ api.get('/oauth/start', requireSession, async (req, res) => {
       sessionId: res.locals.sessionId as string,
       purpose,
       includeComments: req.query.comments === '1',
+      returnTo: safeReturn(req.query.returnTo),
       expiresAt: new Date(Date.now() + 10 * 60 * 1000),
     },
   })
@@ -372,6 +393,7 @@ api.post('/auth/meta/connect', requireSession, async (req, res) => {
   const parsed = z.object({
     purpose: z.enum(['instagram', 'facebook']),
     comments: z.boolean().optional(),
+    returnTo: z.string().optional(),
   }).safeParse(req.body)
   if (!parsed.success) throw new HttpError(400, 'Choose Instagram or a Facebook Page.')
   if (parsed.data.purpose === 'instagram' && !instagramConfigured) {
@@ -387,6 +409,7 @@ api.post('/auth/meta/connect', requireSession, async (req, res) => {
       sessionId: res.locals.sessionId as string,
       purpose: parsed.data.purpose,
       includeComments: parsed.data.comments === true,
+      returnTo: safeReturn(parsed.data.returnTo),
       expiresAt: new Date(Date.now() + 10 * 60 * 1000),
     },
   })
@@ -399,6 +422,27 @@ async function storeConnectedAccounts(code: string, purpose: 'instagram' | 'face
     return { error: purpose === 'instagram' ? 'no_instagram_account' : 'no_page' } as const
   }
   for (const account of found) {
+    const existing = await prisma.socialAccount.findUnique({
+      where: { platform_externalId: { platform: account.platform, externalId: account.externalId } },
+    })
+    const incomingToken = encryptSecret(account.token)
+    let tokenCipher = incomingToken
+    let catalogTokenCipher = existing?.catalogTokenCipher ?? null
+    let tasks = account.tasks
+    if (account.platform === 'instagram' && purpose === 'facebook') {
+      catalogTokenCipher = incomingToken
+      if (existing?.tokenCipher && taskList(existing.tasks).includes('INSTAGRAM_LOGIN')) {
+        tokenCipher = existing.tokenCipher
+        tasks = ['INSTAGRAM_LOGIN', 'FACEBOOK_LOGIN']
+      }
+    }
+    if (account.platform === 'instagram' && purpose === 'instagram' && existing) {
+      const previous = taskList(existing.tasks)
+      if (!catalogTokenCipher && previous.includes('FACEBOOK_LOGIN') && existing.tokenCipher) {
+        catalogTokenCipher = existing.tokenCipher
+      }
+      if (catalogTokenCipher) tasks = ['INSTAGRAM_LOGIN', 'FACEBOOK_LOGIN']
+    }
     const data = {
       pageId: account.pageId,
       name: account.name,
@@ -408,8 +452,9 @@ async function storeConnectedAccounts(code: string, purpose: 'instagram' | 'face
       connected: true,
       followers: account.followers,
       grantedScopes: JSON.stringify(account.scopes),
-      tasks: JSON.stringify(account.tasks),
-      tokenCipher: encryptSecret(account.token),
+      tasks: JSON.stringify(tasks),
+      tokenCipher,
+      catalogTokenCipher,
       tokenExpiresAt: account.tokenExpiresAt,
       dataAccessExpiresAt: account.dataAccessExpiresAt,
       tokenStatus: account.tokenStatus,
@@ -439,8 +484,14 @@ api.get(['/oauth/callback', '/auth/meta/callback'], async (req, res) => {
     return redirectClient(res, { error: 'denied' })
   }
   if (typeof req.query.error === 'string') {
+    const reason = typeof req.query.error_reason === 'string' ? req.query.error_reason : ''
+    const description = typeof req.query.error_description === 'string' ? req.query.error_description : ''
+    const text = `${reason} ${description}`.toLowerCase()
+    const detail = text.includes('permission')
+      ? 'Facebook did not grant Page access. Log in with the Facebook user who manages the Page and accept every permission.'
+      : 'The Facebook login was cancelled before the Page was connected.'
     await prisma.oauthState.delete({ where: { id: saved.id } }).catch(() => undefined)
-    return redirectClient(res, { error: 'denied' })
+    return redirectClient(res, { error: 'denied', detail }, saved.returnTo)
   }
   const code = typeof req.query.code === 'string' ? req.query.code : ''
   if (!code) {
@@ -455,7 +506,7 @@ api.get(['/oauth/callback', '/auth/meta/callback'], async (req, res) => {
   const purpose = saved.purpose === 'facebook' ? 'facebook' : 'instagram'
   try {
     const result = await storeConnectedAccounts(code, purpose)
-    redirectClient(res, result.error ? { error: result.error } : { connected: result.connected })
+    redirectClient(res, result.error ? { error: result.error } : { connected: result.connected }, result.error ? '' : saved.returnTo)
   } catch (error) {
     const message = error instanceof Error ? error.message : 'connection_failed'
     redirectClient(res, { error: 'connection_failed', detail: redact(message).slice(0, 180) })
@@ -593,17 +644,21 @@ api.post(['/media', '/media/upload'], requireSession, rateLimit('upload', 40, 60
   res.status(201).json({ media: presentMedia(media), errors })
 })
 
+async function sendStoredMedia(res: Response, media: MediaAsset, cache: string) {
+  res.setHeader('Content-Type', media.mime)
+  res.setHeader('Cache-Control', cache)
+  const stream = await storage.open(media.storageKey).openStream()
+  stream.on('error', () => {
+    if (!res.headersSent) res.status(404).end()
+    else res.destroy()
+  })
+  stream.pipe(res)
+}
+
 api.get('/media/:id/preview', requireSession, async (req, res) => {
   const media = await prisma.mediaAsset.findUnique({ where: { id: String(req.params.id) } })
   if (!media) throw new HttpError(404, 'Media not found.')
-  res.setHeader('Content-Type', media.mime)
-  res.setHeader('Cache-Control', 'private, max-age=3600')
-  const opened = storage.open(media.storageKey)
-  try {
-    opened.stream().pipe(res)
-  } catch {
-    res.send(await opened.read())
-  }
+  await sendStoredMedia(res, media, 'private, max-age=3600')
 })
 
 api.get('/media/public/:id', async (req, res) => {
@@ -615,14 +670,7 @@ api.get('/media/public/:id', async (req, res) => {
   }
   const media = await prisma.mediaAsset.findUnique({ where: { id } })
   if (!media) throw new HttpError(404, 'Media not found.')
-  res.setHeader('Content-Type', media.mime)
-  res.setHeader('Cache-Control', 'public, max-age=300')
-  const opened = storage.open(media.storageKey)
-  try {
-    opened.stream().pipe(res)
-  } catch {
-    res.send(await opened.read())
-  }
+  await sendStoredMedia(res, media, 'public, max-age=300')
 })
 
 api.delete('/media/:id', requireSession, async (req, res) => {
@@ -637,6 +685,87 @@ api.delete('/media/:id', requireSession, async (req, res) => {
   res.json({ ok: true })
 })
 
+async function catalogAccess(account: SocialAccount) {
+  const saved = pageTokenCipher(account)
+  if (saved) return { token: saved, needsLink: false, reason: null }
+  const pages = await prisma.socialAccount.findMany({
+    where: { platform: 'facebook', connected: true, tokenCipher: { not: null } },
+  })
+  const version = env.META_GRAPH_VERSION || 'v26.0'
+  for (const page of pages) {
+    if (!page.tokenCipher) continue
+    const response = await fetch(`https://graph.facebook.com/${version}/${page.externalId}?fields=instagram_business_account{id}`, {
+      headers: { Authorization: `Bearer ${decryptSecret(page.tokenCipher)}` },
+    })
+    if (!response.ok) continue
+    const body = await response.json() as { instagram_business_account?: { id?: string } }
+    if (body.instagram_business_account?.id !== account.externalId) continue
+    const tasks = [...new Set([...taskList(account.tasks), 'FACEBOOK_LOGIN'])]
+    await prisma.socialAccount.update({
+      where: { id: account.id },
+      data: { catalogTokenCipher: page.tokenCipher, tasks: JSON.stringify(tasks) },
+    })
+    return { token: page.tokenCipher, needsLink: false, reason: null }
+  }
+  if (pages.length === 0) {
+    return {
+      token: null,
+      needsLink: false,
+      reason: 'Instagram only shares its song catalog through the Facebook Page that owns this account.',
+    }
+  }
+  const names = pages.map((page) => page.name).join(', ')
+  const linked = pages.length === 1
+    ? `${names} is connected, but that Page is not linked to ${account.handle}.`
+    : `${names} are connected, but none of those Pages is linked to ${account.handle}.`
+  return {
+    token: null,
+    needsLink: true,
+    reason: `${linked} In Instagram, link this professional account to that Facebook Page, then connect the Page again.`,
+  }
+}
+
+function allowedAudioHost(hostname: string) {
+  return hostname === 'fbcdn.net' || hostname.endsWith('.fbcdn.net') || hostname === 'cdninstagram.com' || hostname.endsWith('.cdninstagram.com')
+}
+
+function audioFilePath(remote: string | null) {
+  if (!remote) return null
+  let url: URL
+  try {
+    url = new URL(remote)
+  } catch {
+    return null
+  }
+  if (url.protocol !== 'https:' || !allowedAudioHost(url.hostname)) return null
+  const exp = Math.floor(Date.now() / 1000) + 30 * 60
+  const sig = signValue(`audio.${exp}.${remote}`)
+  return browserPath(`/api/audio/file?exp=${exp}&sig=${sig}&src=${encodeURIComponent(remote)}`)
+}
+
+api.get('/audio/file', async (req, res) => {
+  const exp = Number(req.query.exp)
+  const sig = typeof req.query.sig === 'string' ? req.query.sig : ''
+  const src = typeof req.query.src === 'string' ? req.query.src : ''
+  if (!exp || exp < Math.floor(Date.now() / 1000) || !signaturesMatch(sig, signValue(`audio.${exp}.${src}`))) {
+    throw new HttpError(403, 'This song preview has expired. Search again.')
+  }
+  let url: URL
+  try {
+    url = new URL(src)
+  } catch {
+    throw new HttpError(400, 'This song has no preview.')
+  }
+  if (url.protocol !== 'https:' || !allowedAudioHost(url.hostname)) throw new HttpError(400, 'This song has no preview.')
+  const upstream = await fetch(url)
+  if (!upstream.ok) throw new HttpError(502, 'Instagram did not return this preview.')
+  res.status(200)
+  const type = upstream.headers.get('content-type')
+  if (type) res.setHeader('Content-Type', type)
+  res.setHeader('Cache-Control', 'private, max-age=300')
+  res.send(Buffer.from(await upstream.arrayBuffer()))
+})
+
 api.get('/audio', requireSession, async (req, res) => {
   const accountId = typeof req.query.accountId === 'string' ? req.query.accountId : ''
   const type = req.query.type === 'original_sound' ? 'original_sound' : 'music'
@@ -645,15 +774,16 @@ api.get('/audio', requireSession, async (req, res) => {
   if (!account || account.platform !== 'instagram' || !account.connected || !account.tokenCipher) {
     throw new HttpError(400, 'Choose a connected Instagram account before looking up songs.')
   }
-  if (account.tasks.includes('INSTAGRAM_LOGIN') && !account.tasks.includes('FACEBOOK_LOGIN')) {
-    return res.json({
-      tracks: [],
-      available: false,
-      reason: 'This Instagram login cannot browse songs. Connect the Facebook Page that owns the account, then choose that Instagram account.',
-    })
+  const catalog = await catalogAccess(account)
+  if (!catalog.token) {
+    return res.json({ tracks: [], available: false, needsPage: true, needsLink: catalog.needsLink, reason: catalog.reason })
   }
-  const tracks = await socialProvider.searchAudio(decryptSecret(account.tokenCipher), account.externalId, type, query)
-  res.json({ tracks, available: true, reason: null })
+  const tracks = (await socialProvider.searchAudio(decryptSecret(catalog.token), account.externalId, type, query)).map((track) => ({
+    ...track,
+    previewUrl: audioFilePath(track.previewUrl),
+    artworkUrl: audioFilePath(track.artworkUrl),
+  }))
+  res.json({ tracks, available: true, needsPage: false, needsLink: false, reason: null })
 })
 
 api.get('/content', requireSession, async (req, res) => {
@@ -724,8 +854,8 @@ api.post('/content', requireSession, async (req, res) => {
   }
   if (input.audio) {
     const instagram = accounts.find((account) => destinations.some((destination) => destination.accountId === account.id && songFormats.has(destination.format)))
-    if (instagram?.tasks.includes('INSTAGRAM_LOGIN') && !instagram.tasks.includes('FACEBOOK_LOGIN')) {
-      throw new HttpError(400, 'This Instagram login cannot attach a catalog song. Connect the Facebook Page that owns the account, then choose that Instagram account.')
+    if (instagram && !pageTokenCipher(instagram)) {
+      throw new HttpError(400, 'Connect the Facebook Page that owns this Instagram account before attaching a song.')
     }
   }
   const created = await prisma.content.create({

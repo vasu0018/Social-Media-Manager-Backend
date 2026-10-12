@@ -23,6 +23,21 @@ function scopesOf(account: SocialAccount) {
   }
 }
 
+export function taskList(raw: string) {
+  try {
+    const parsed = JSON.parse(raw) as unknown
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === 'string') : []
+  } catch {
+    return []
+  }
+}
+
+export function pageTokenCipher(account: Pick<SocialAccount, 'tasks' | 'tokenCipher' | 'catalogTokenCipher'>) {
+  if (account.catalogTokenCipher) return account.catalogTokenCipher
+  if (taskList(account.tasks).includes('FACEBOOK_LOGIN') && account.tokenCipher) return account.tokenCipher
+  return null
+}
+
 export function storySupport(account: SocialAccount | null, format: ContentFormat) {
   if (!format.endsWith('story')) return { supported: true, message: 'This format is supported by the current Graph API integration.' }
   if (!account) {
@@ -257,20 +272,26 @@ async function publishClaimed(existing: Loaded) {
   }
   if (!account.tokenCipher) throw new PermanentPublishError(400, 'Reconnect this account before publishing.')
   const { decryptSecret } = await import('./crypto.js')
+  const tasks = taskList(account.tasks)
+  const songOnInstagram = Boolean(content.audioId) && (format === 'instagram_reel' || format === 'instagram_feed_video')
+  const catalogToken = songOnInstagram ? pageTokenCipher(account) : null
+  if (songOnInstagram && !catalogToken) {
+    throw new PermanentPublishError(400, 'Connect the Facebook Page that owns this Instagram account before publishing a Reel with a song.')
+  }
   const result = await socialProvider.publish({
     format,
     caption: content.caption,
     hashtags: content.hashtags,
     firstComment: content.firstComment,
-    token: decryptSecret(account.tokenCipher),
+    token: decryptSecret(catalogToken ?? account.tokenCipher),
     pageId: account.pageId,
     igId: account.platform === 'instagram' ? account.externalId : null,
-    instagramLogin: account.tasks.includes('INSTAGRAM_LOGIN'),
+    instagramLogin: tasks.includes('INSTAGRAM_LOGIN') && !tasks.includes('FACEBOOK_LOGIN') && !catalogToken,
     kind: content.media.kind as 'image' | 'video',
     mime: content.media.mime,
     bytes,
     publicUrl,
-    audio: content.audioId ? {
+    audio: songOnInstagram && content.audioId ? {
       id: content.audioId,
       audioVolume: content.audioVolume,
       videoVolume: content.videoVolume,

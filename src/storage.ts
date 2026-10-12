@@ -1,5 +1,5 @@
 import { createReadStream } from 'node:fs'
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { access, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3'
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
@@ -9,6 +9,7 @@ import { signValue } from './crypto.js'
 export type StoredObject = {
   read: () => Promise<Buffer>
   stream: () => NodeJS.ReadableStream
+  openStream: () => Promise<NodeJS.ReadableStream>
   publicUrl: (id: string, seconds: number) => Promise<string>
   remove: () => Promise<void>
 }
@@ -31,6 +32,10 @@ class LocalStorage implements MediaStorage {
     return {
       read: () => readFile(file),
       stream: () => createReadStream(file),
+      openStream: async () => {
+        await access(file)
+        return createReadStream(file)
+      },
       publicUrl: async (id, seconds) => {
         const exp = Math.floor(Date.now() / 1000) + seconds
         const sig = signValue(`${id}.${exp}`)
@@ -80,6 +85,11 @@ class S3Storage implements MediaStorage {
       stream: () => {
         throw new Error('S3 preview is served through a signed URL')
       },
+      openStream: async () => {
+        const result = await this.client.send(new GetObjectCommand({ Bucket: env.S3_BUCKET, Key: remoteKey }))
+        if (!result.Body) throw new Error('Stored media is missing')
+        return result.Body as NodeJS.ReadableStream
+      },
       publicUrl: (_id, seconds) => getSignedUrl(
         this.client,
         new GetObjectCommand({ Bucket: env.S3_BUCKET, Key: remoteKey }),
@@ -116,6 +126,14 @@ class MirroredStorage implements MediaStorage {
         }
       },
       stream: () => local.stream(),
+      openStream: async () => {
+        try {
+          return await local.openStream()
+        } catch (error) {
+          if (!remote) throw error
+          return remote.openStream()
+        }
+      },
       publicUrl: (id, seconds) => (remote ? remote.publicUrl(id, seconds) : local.publicUrl(id, seconds)),
       remove: async () => {
         await local.remove()

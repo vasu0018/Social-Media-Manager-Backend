@@ -34,6 +34,7 @@ model OauthState {
   sessionId       String
   purpose         String
   includeComments Boolean  @default(false)
+  returnTo        String   @default("")
   expiresAt       DateTime
 }
 
@@ -51,6 +52,7 @@ model SocialAccount {
   grantedScopes       String               @default("[]")
   tasks               String               @default("[]")
   tokenCipher         String?
+  catalogTokenCipher  String?
   tokenExpiresAt      DateTime?
   dataAccessExpiresAt DateTime?
   tokenStatus         String               @default("unknown")

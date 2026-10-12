@@ -24,6 +24,7 @@ export type DiscoveredAccount = {
 type DebugData = {
   is_valid?: boolean
   scopes?: string[]
+  granular_scopes?: Array<{ scope?: string; target_ids?: string[] }>
   expires_at?: number
   data_access_expires_at?: number
   error?: { code?: number; message?: string }
@@ -57,6 +58,9 @@ async function readError(response: Response) {
     const parsed = JSON.parse(body) as { error?: { message?: string; code?: number } }
     const message = parsed.error?.message ?? 'Meta rejected the request.'
     if (parsed.error?.code === 190) return 'The connection was revoked. Reconnect the account.'
+    if (/validating client secret/i.test(message)) {
+      return 'The app secret does not match this Meta app. Paste the Facebook App secret into META_APP_SECRET, then restart the API.'
+    }
     return scrub(message)
   } catch {
     return 'Meta rejected the request.'
@@ -155,18 +159,75 @@ type PageNode = {
   }
 }
 
-async function listPages(userToken: string) {
-  const fields = 'id,name,access_token,tasks,fan_count,picture{url},instagram_business_account{id,username,name,profile_picture_url,followers_count}'
-  let next: string | null = `https://graph.facebook.com/${version()}/me/accounts?fields=${fields}&limit=50`
+const pageFields = 'id,name,access_token,tasks,fan_count,picture{url},instagram_business_account{id,username,name,profile_picture_url,followers_count}'
+
+async function readPages(url: string, token: string) {
   const pages: PageNode[] = []
+  let next: string | null = url
   while (next && pages.length < 100) {
-    const response = await fetch(next, { headers: { Authorization: `Bearer ${userToken}` } })
+    const response = await fetch(next, { headers: { Authorization: `Bearer ${token}` } })
     if (!response.ok) throw classifyMetaError(response.status, await readError(response))
     const data = await response.json() as { data?: PageNode[]; paging?: { next?: string } }
     pages.push(...(data.data ?? []))
     next = data.paging?.next ?? null
   }
   return pages
+}
+
+async function listBusinessPages(userToken: string) {
+  let businesses: Array<{ id: string }> = []
+  try {
+    const result = await graph<{ data?: Array<{ id: string }> }>('/me/businesses?fields=id&limit=25', userToken)
+    businesses = result.data ?? []
+  } catch {
+    return []
+  }
+  const pages: PageNode[] = []
+  for (const business of businesses) {
+    for (const edge of ['owned_pages', 'client_pages']) {
+      try {
+        const result = await graph<{ data?: PageNode[] }>(`/${business.id}/${edge}?fields=${pageFields}&limit=50`, userToken)
+        pages.push(...(result.data ?? []))
+      } catch {
+        // This business edge is not available to the logged-in user.
+      }
+    }
+  }
+  return pages
+}
+
+async function listPages(userToken: string) {
+  const direct = await readPages(`https://graph.facebook.com/${version()}/me/accounts?fields=${encodeURIComponent(pageFields)}&limit=50`, userToken)
+  const managed = await listBusinessPages(userToken)
+  const byId = new Map<string, PageNode>()
+  for (const page of [...direct, ...managed]) {
+    if (!page.id) continue
+    const current = byId.get(page.id)
+    byId.set(page.id, current ? { ...current, ...page, access_token: page.access_token || current.access_token } : page)
+  }
+  const pages = [...byId.values()]
+  for (const page of pages) {
+    if (page.access_token) continue
+    try {
+      const loaded = await graph<PageNode>(`/${page.id}?fields=${pageFields}`, userToken)
+      Object.assign(page, { ...loaded, access_token: loaded.access_token || page.access_token })
+    } catch {
+      // The Page is visible, but this login cannot manage it.
+    }
+  }
+  return pages.filter((page) => Boolean(page.access_token))
+}
+
+function missingPageMessage(debug: DebugData | null) {
+  const scopes = debug?.scopes ?? []
+  if (!scopes.includes('pages_show_list')) {
+    return 'Facebook did not grant Page access. Connect again and allow your Pages.'
+  }
+  const pageScope = debug?.granular_scopes?.find((entry) => entry.scope === 'pages_show_list')
+  if (pageScope && Array.isArray(pageScope.target_ids) && pageScope.target_ids.length === 0) {
+    return 'No Page was selected. Connect again and tick the Page that owns the Instagram account.'
+  }
+  return 'This Facebook login does not manage a Page. Log in as the person who manages the Page, and select that Page when Facebook asks.'
 }
 
 function sleep(ms: number) {
@@ -430,7 +491,11 @@ function audioText(value: unknown) {
 }
 
 export async function searchInstagramAudio(token: string, igUserId: string, audioType: 'music' | 'original_sound', query: string): Promise<InstagramAudio[]> {
-  const params = new URLSearchParams({ audio_type: audioType, user_id: igUserId })
+  const params = new URLSearchParams({
+    audio_type: audioType,
+    user_id: igUserId,
+    fields: 'audio_id,title,display_artist,ig_username,duration_in_ms,download_url,cover_artwork_thumbnail_uri,cover_artwork_thumbnail_url,profile_picture_url',
+  })
   if (query.trim()) params.set('search_query', query.trim().slice(0, 80))
   const result = await graph<{ audio?: Array<Record<string, unknown>> }>(`/ig_audio?${params.toString()}`, token)
   return (result.audio ?? []).slice(0, 25).map((item) => ({
@@ -439,7 +504,7 @@ export async function searchInstagramAudio(token: string, igUserId: string, audi
     artist: audioText(item.display_artist) ?? audioText(item.ig_username),
     durationMs: typeof item.duration_in_ms === 'number' ? item.duration_in_ms : null,
     artworkUrl: audioText(item.cover_artwork_thumbnail_uri) ?? audioText(item.cover_artwork_thumbnail_url) ?? audioText(item.profile_picture_url),
-    previewUrl: audioText(item.download_url) ?? audioText(item.on_platform_audio_preview_link),
+    previewUrl: audioText(item.download_url),
     type: audioType,
   })).filter((item) => item.id.length > 0)
 }
@@ -467,6 +532,7 @@ export const metaProvider = {
       state,
       response_type: 'code',
       scope: scopesFor('facebook', includeComments).join(','),
+      auth_type: 'rerequest',
     })
     return `https://www.facebook.com/${version()}/dialog/oauth?${params.toString()}`
   },
@@ -492,6 +558,10 @@ export const metaProvider = {
     const longToken = await long.json() as { access_token?: string }
     const userToken = longToken.access_token ?? shortToken.access_token
     const pages = await listPages(userToken)
+    if (pages.length === 0) {
+      const debug = await debugToken(userToken).catch(() => null)
+      throw new HttpError(400, missingPageMessage(debug))
+    }
     const accounts: DiscoveredAccount[] = []
 
     for (const page of pages) {
