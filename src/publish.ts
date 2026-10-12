@@ -263,6 +263,7 @@ async function publishClaimed(existing: Loaded) {
     bytes: bytes.length,
   })
   if (errors.length > 0) throw new PermanentPublishError(400, errors[0] ?? 'This file does not meet the platform requirements.')
+  const songOnInstagram = Boolean(content.audioId) && (format === 'instagram_reel' || format === 'instagram_feed_video')
   let publicUrl: string | null = null
   if (content.media.kind === 'image' && format.startsWith('instagram')) {
     if (!remoteCopyEnabled && publicBaseIsLocal()) {
@@ -270,10 +271,37 @@ async function publishClaimed(existing: Loaded) {
     }
     publicUrl = await storage.open(content.media.storageKey).publicUrl(content.media.id, 60 * 60)
   }
+  if (content.media.kind === 'video' && songOnInstagram) {
+    if (!remoteCopyEnabled && publicBaseIsLocal()) {
+      throw new PermanentPublishError(400, 'Instagram attaches a catalog song only when it downloads the video from a public HTTPS address. Set PUBLIC_BASE_URL to an address Meta can reach.')
+    }
+    publicUrl = await storage.open(content.media.storageKey).publicUrl(content.media.id, 60 * 60)
+  }
+  const coverFormats = new Set(['instagram_reel', 'instagram_feed_video', 'facebook_reel', 'facebook_video'])
+  let coverUrl: string | null = null
+  let coverBytes: Buffer | null = null
+  let coverMime: string | null = null
+  if (content.coverMediaId && coverFormats.has(format)) {
+    const cover = await prisma.mediaAsset.findUnique({ where: { id: content.coverMediaId } })
+    if (!cover || cover.kind !== 'image' || (cover.mime !== 'image/jpeg' && cover.mime !== 'image/png')) {
+      throw new PermanentPublishError(400, 'The cover must be a JPEG or PNG photo.')
+    }
+    const opened = storage.open(cover.storageKey)
+    coverBytes = await opened.read()
+    coverMime = cover.mime
+    if (format.startsWith('instagram')) {
+      if (!remoteCopyEnabled && publicBaseIsLocal()) {
+        throw new PermanentPublishError(400, 'Instagram has to download the cover photo from a public HTTPS address. Set PUBLIC_BASE_URL, or choose a frame from the video instead.')
+      }
+      coverUrl = await opened.publicUrl(cover.id, 60 * 60)
+    }
+  }
+  const thumbOffsetMs = content.thumbOffsetMs != null && content.media.durationMs != null
+    ? Math.min(Math.max(content.thumbOffsetMs, 0), content.media.durationMs)
+    : content.thumbOffsetMs
   if (!account.tokenCipher) throw new PermanentPublishError(400, 'Reconnect this account before publishing.')
   const { decryptSecret } = await import('./crypto.js')
   const tasks = taskList(account.tasks)
-  const songOnInstagram = Boolean(content.audioId) && (format === 'instagram_reel' || format === 'instagram_feed_video')
   const catalogToken = songOnInstagram ? pageTokenCipher(account) : null
   if (songOnInstagram && !catalogToken) {
     throw new PermanentPublishError(400, 'Connect the Facebook Page that owns this Instagram account before publishing a Reel with a song.')
@@ -296,6 +324,10 @@ async function publishClaimed(existing: Loaded) {
       audioVolume: content.audioVolume,
       videoVolume: content.videoVolume,
     } : null,
+    coverUrl,
+    thumbOffsetMs,
+    coverBytes,
+    coverMime,
   })
   await prisma.contentDestination.update({
     where: { id: existing.id },

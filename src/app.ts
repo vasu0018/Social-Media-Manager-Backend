@@ -16,7 +16,7 @@ export function createApp() {
     allowedHeaders: ['Content-Type'],
   }))
   app.use(cookieParser())
-  app.use(express.json({ limit: '1mb' }))
+  app.use(express.json({ limit: '6mb' }))
   app.get('/', (_req, res) => {
     res.json({ ok: true })
   })

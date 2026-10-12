@@ -80,6 +80,7 @@ model MediaAsset {
   createdAt  DateTime  @default(now())
   updatedAt  DateTime  @updatedAt
   contents   Content[]
+  coverFor   Content[] @relation("ContentCover")
 }
 
 model Content {
@@ -93,6 +94,9 @@ model Content {
   audioArtist   String?
   audioVolume   Int                  @default(100)
   videoVolume   Int                  @default(100)
+  coverMediaId  String?
+  coverMedia    MediaAsset?          @relation("ContentCover", fields: [coverMediaId], references: [id], onDelete: SetNull)
+  thumbOffsetMs Int?
   format        String
   status        String
   timezone      String               @default("UTC")

@@ -27,6 +27,8 @@ const schema = z.object({
   S3_ACCESS_KEY_ID: z.string().default(''),
   S3_SECRET_ACCESS_KEY: z.string().default(''),
   S3_KEY_PREFIX: z.string().default(''),
+  OPENAI_API_KEY: z.string().default(''),
+  OPENAI_MODEL: z.string().default('gpt-4o-mini'),
 })
 
 export const env = schema.parse(process.env)

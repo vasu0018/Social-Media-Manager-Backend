@@ -9,6 +9,7 @@ import { prisma } from './db.js'
 import { coarseType, contentFormats, HttpError, platformFor, validateProbe, type ContentFormat } from './domain.js'
 import { env, instagramConfigured, isDevelopment, metaConfigured } from './env.js'
 import { socialProvider } from './meta/provider.js'
+import { suggestCaption } from './ai/caption.js'
 import { assertCanPublish, pageTokenCipher, permalinkFor, rollupContent, taskList } from './publish.js'
 import { probeBuffer } from './probe.js'
 import { enqueuePublication, removePublicationJob } from './queue.js'
@@ -119,6 +120,8 @@ function presentContent(item: ContentRecord) {
       audioVolume: item.audioVolume,
       videoVolume: item.videoVolume,
     } : null,
+    coverMediaId: item.coverMediaId,
+    thumbOffsetMs: item.thumbOffsetMs,
     format,
     type: coarseType(format),
     platforms: platforms.length > 0 ? platforms : [platformFor(format)],
@@ -207,6 +210,8 @@ const contentSchema = z.object({
     audioVolume: z.number().int().min(1).max(100).default(100),
     videoVolume: z.number().int().min(1).max(100).default(60),
   }).nullable().optional(),
+  coverMediaId: z.string().trim().min(1).nullable().optional(),
+  thumbOffsetMs: z.number().int().min(0).max(15 * 60 * 1000).nullable().optional(),
   format: z.enum(contentFormats).optional(),
   accountId: z.string().nullable().optional(),
   destinations: z.array(destinationSchema).max(6).optional(),
@@ -267,7 +272,7 @@ function assertEditable(item: ContentRecord) {
 
 function pageQuery(req: Request) {
   const page = Math.max(1, Number(req.query.page) || 1)
-  const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize) || 100))
+  const pageSize = Math.min(200, Math.max(1, Number(req.query.pageSize) || 100))
   return { page, pageSize, skip: (page - 1) * pageSize }
 }
 
@@ -806,6 +811,15 @@ api.get('/audio', requireSession, async (req, res) => {
   res.json({ tracks, available: true, needsPage: false, needsLink: false, reason: null })
 })
 
+api.post('/ai/caption', requireSession, rateLimit('ai-caption', 30, 60 * 60_000), async (req, res) => {
+  const parsed = z.object({
+    kind: z.enum(['reel', 'story', 'image', 'video']),
+    images: z.array(z.string().min(32).max(1_500_000)).min(1).max(3),
+  }).safeParse(req.body)
+  if (!parsed.success) throw new HttpError(400, 'Upload a photo or reel before asking for a caption.')
+  res.json(await suggestCaption(parsed.data.kind, parsed.data.images))
+})
+
 api.get('/content', requireSession, async (req, res) => {
   res.json(await listContent(req))
 })
@@ -878,6 +892,17 @@ api.post('/content', requireSession, async (req, res) => {
       throw new HttpError(400, 'Connect the Facebook Page that owns this Instagram account before attaching a song.')
     }
   }
+  const coverFormats = new Set(['instagram_reel', 'instagram_feed_video', 'facebook_reel', 'facebook_video'])
+  const wantsCover = destinations.some((destination) => coverFormats.has(destination.format))
+  let coverMediaId: string | null = null
+  if (wantsCover && input.coverMediaId) {
+    const cover = await prisma.mediaAsset.findUnique({ where: { id: input.coverMediaId } })
+    if (!cover || cover.kind !== 'image' || (cover.mime !== 'image/jpeg' && cover.mime !== 'image/png')) {
+      throw new HttpError(400, 'The cover must be a JPEG or PNG photo.')
+    }
+    coverMediaId = cover.id
+  }
+  const thumbOffsetMs = wantsCover && !coverMediaId ? input.thumbOffsetMs ?? null : null
   const created = await prisma.content.create({
     data: {
       title: input.title,
@@ -889,6 +914,8 @@ api.post('/content', requireSession, async (req, res) => {
       audioArtist: input.audio?.artist ?? null,
       audioVolume: input.audio?.audioVolume ?? 100,
       videoVolume: input.audio?.videoVolume ?? 60,
+      coverMediaId,
+      thumbOffsetMs,
       format: destinations[0]?.format ?? input.format ?? 'instagram_reel',
       status: input.action === 'publish' ? 'processing' : input.action === 'schedule' ? 'scheduled' : 'draft',
       timezone: input.timezone,
@@ -928,9 +955,67 @@ api.patch('/content/:id', requireSession, async (req, res) => {
     caption: z.string().max(5000).optional(),
     hashtags: z.string().max(1000).optional(),
     firstComment: z.string().max(2200).nullable().optional(),
+    mediaId: z.string().nullable().optional(),
+    coverMediaId: z.string().nullable().optional(),
+    thumbOffsetMs: z.number().int().min(0).max(15 * 60 * 1000).nullable().optional(),
+    audio: z.object({
+      id: z.string().trim().min(1).max(64),
+      title: z.string().trim().min(1).max(200),
+      artist: z.string().trim().max(200).nullable().optional(),
+      audioVolume: z.number().int().min(1).max(100).default(100),
+      videoVolume: z.number().int().min(1).max(100).default(60),
+    }).nullable().optional(),
+    destinations: z.array(destinationSchema).max(6).optional(),
   }).safeParse(req.body)
   if (!parsed.success) throw new HttpError(400, 'Check the content fields.')
-  await prisma.content.update({ where: { id: item.id }, data: parsed.data })
+  const patch = parsed.data
+  await prisma.content.update({
+    where: { id: item.id },
+    data: {
+      ...(patch.title !== undefined ? { title: patch.title } : {}),
+      ...(patch.caption !== undefined ? { caption: patch.caption } : {}),
+      ...(patch.hashtags !== undefined ? { hashtags: patch.hashtags } : {}),
+      ...(patch.firstComment !== undefined ? { firstComment: patch.firstComment } : {}),
+      ...(patch.mediaId !== undefined ? { mediaId: patch.mediaId } : {}),
+      ...(patch.audio !== undefined ? {
+        audioId: patch.audio?.id ?? null,
+        audioTitle: patch.audio?.title ?? null,
+        audioArtist: patch.audio?.artist ?? null,
+        audioVolume: patch.audio?.audioVolume ?? 100,
+        videoVolume: patch.audio?.videoVolume ?? 60,
+      } : {}),
+      ...(patch.coverMediaId !== undefined ? { coverMediaId: patch.coverMediaId } : {}),
+      ...(patch.thumbOffsetMs !== undefined ? { thumbOffsetMs: patch.thumbOffsetMs } : {}),
+    },
+  })
+  if (patch.destinations) {
+    const scheduled = item.destinations.some((destination) => destination.status !== 'draft')
+    const same = item.destinations.length === patch.destinations.length
+      && item.destinations.every((destination) => patch.destinations?.some((next) => next.accountId === destination.accountId && next.format === destination.format))
+    if (!same) {
+      if (scheduled) throw new HttpError(409, 'Cancel the schedule before changing Instagram or Facebook on this item.')
+      for (const destination of patch.destinations) {
+        if (platformFor(destination.format) !== destination.platform) throw new HttpError(400, 'Each destination must use a format for its own platform.')
+        const account = await prisma.socialAccount.findUnique({ where: { id: destination.accountId } })
+        if (!account || !account.connected) throw new HttpError(400, 'That account is no longer connected.')
+      }
+      for (const destination of item.destinations) await removePublicationJob(destination.id)
+      await prisma.contentDestination.deleteMany({ where: { contentId: item.id } })
+      if (patch.destinations.length > 0) {
+        await prisma.contentDestination.createMany({
+          data: patch.destinations.map((destination) => ({
+            contentId: item.id,
+            accountId: destination.accountId,
+            platform: destination.platform,
+            format: destination.format,
+            status: 'draft',
+            idempotencyKey: `${item.id}:${destination.accountId}:${destination.format}`,
+          })),
+        })
+        await prisma.content.update({ where: { id: item.id }, data: { format: patch.destinations[0]?.format ?? item.format } })
+      }
+    }
+  }
   await audit('content.edit', 'Content', item.id, 'Updated draft or scheduled fields without creating a new publication.')
   res.json({ item: presentContent(await loadContent(item.id)) })
 })
@@ -1011,6 +1096,8 @@ api.post('/content/:id/duplicate', requireSession, async (req, res) => {
       audioArtist: existing.audioArtist,
       audioVolume: existing.audioVolume,
       videoVolume: existing.videoVolume,
+      coverMediaId: existing.coverMediaId,
+      thumbOffsetMs: existing.thumbOffsetMs,
       format: existing.format,
       status: 'draft',
       timezone: existing.timezone,
@@ -1196,6 +1283,8 @@ api.post('/content/:id/repost', requireSession, async (req, res) => {
       audioArtist: existing.audioArtist,
       audioVolume: existing.audioVolume,
       videoVolume: existing.videoVolume,
+      coverMediaId: existing.coverMediaId,
+      thumbOffsetMs: existing.thumbOffsetMs,
       format: existing.format,
       status: 'draft',
       timezone: existing.timezone,

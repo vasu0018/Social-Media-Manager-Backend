@@ -291,6 +291,10 @@ async function publishInstagram(input: PublishInput) {
       video_volume: input.audio.videoVolume,
     })
   }
+  if (reel && input.kind === 'video' && input.coverUrl) fields.cover_url = input.coverUrl
+  else if (reel && input.kind === 'video' && input.thumbOffsetMs && input.thumbOffsetMs > 0) {
+    fields.thumb_offset = String(Math.round(input.thumbOffsetMs))
+  }
 
   let containerId = ''
   if (input.kind === 'image') {
@@ -298,6 +302,13 @@ async function publishInstagram(input: PublishInput) {
       throw new HttpError(400, 'Instagram image publishing needs a public HTTPS media URL. Set PUBLIC_BASE_URL to an address Meta can reach, or configure private S3 storage.')
     }
     fields.image_url = input.publicUrl
+    const container = await graph<{ id: string }>(`/${input.igId}/media`, input.token, { method: 'POST', body: form(fields), host })
+    containerId = container.id
+  } else if (input.audio && reel) {
+    if (!input.publicUrl?.startsWith('https://')) {
+      throw new HttpError(400, 'Instagram attaches a catalog song only when it downloads the video from a public HTTPS address. Set PUBLIC_BASE_URL to an address Meta can reach.')
+    }
+    fields.video_url = input.publicUrl
     const container = await graph<{ id: string }>(`/${input.igId}/media`, input.token, { method: 'POST', body: form(fields), host })
     containerId = container.id
   } else {
@@ -358,7 +369,8 @@ async function publishFacebook(input: PublishInput) {
       body,
       host: 'https://graph-video.facebook.com',
     })
-    return { externalId: result.id }
+    const warning = await preferFacebookCover(result.id, input)
+    return { externalId: result.id, warning }
   }
 
   if (input.format === 'facebook_reel' || (input.format === 'facebook_story' && input.kind === 'video')) {
@@ -377,7 +389,8 @@ async function publishFacebook(input: PublishInput) {
         description: text,
       }),
     })
-    return { externalId: start.video_id }
+    const warning = input.format === 'facebook_reel' ? await preferFacebookCover(start.video_id, input) : undefined
+    return { externalId: start.video_id, warning }
   }
 
   const photo = new FormData()
@@ -405,6 +418,24 @@ export type PublishInput = {
   bytes: Buffer
   publicUrl: string | null
   audio?: { id: string; audioVolume: number; videoVolume: number } | null
+  coverUrl?: string | null
+  thumbOffsetMs?: number | null
+  coverBytes?: Buffer | null
+  coverMime?: string | null
+}
+
+async function preferFacebookCover(videoId: string, input: PublishInput) {
+  if (!input.coverBytes || !input.coverMime) return undefined
+  try {
+    const thumb = new FormData()
+    thumb.set('is_preferred', 'true')
+    thumb.set('source', new File([new Uint8Array(input.coverBytes)], 'cover.jpg', { type: input.coverMime }))
+    await graph(`/${videoId}/thumbnails`, input.token, { method: 'POST', body: thumb })
+    return undefined
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Facebook did not accept the cover.'
+    return `Published, but Facebook did not use the cover image. ${message}`
+  }
 }
 
 export type InstagramAudio = {
