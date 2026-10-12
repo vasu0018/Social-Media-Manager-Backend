@@ -706,6 +706,28 @@ api.get('/media/public/:id', async (req, res) => {
   await sendStoredMedia(req, res, media, 'public, max-age=300')
 })
 
+api.post('/media/bulk-delete', requireSession, async (req, res) => {
+  const blocked = await prisma.content.findMany({
+    where: {
+      status: { in: ['scheduled', 'processing'] },
+      OR: [{ mediaId: { not: null } }, { coverMediaId: { not: null } }],
+    },
+    select: { mediaId: true, coverMediaId: true },
+  })
+  const keep = new Set(blocked.flatMap((item) => [item.mediaId, item.coverMediaId].filter((id): id is string => Boolean(id))))
+  const media = await prisma.mediaAsset.findMany({ where: keep.size > 0 ? { id: { notIn: [...keep] } } : undefined })
+  const ids = media.map((item) => item.id)
+  if (ids.length > 0) {
+    await prisma.content.updateMany({ where: { mediaId: { in: ids } }, data: { mediaId: null } })
+    await prisma.content.updateMany({ where: { coverMediaId: { in: ids } }, data: { coverMediaId: null } })
+    for (const item of media) {
+      await storage.open(item.storageKey).remove().catch(() => undefined)
+    }
+    await prisma.mediaAsset.deleteMany({ where: { id: { in: ids } } })
+  }
+  res.json({ ok: true, deleted: ids.length, skipped: keep.size })
+})
+
 api.delete('/media/:id', requireSession, async (req, res) => {
   const media = await prisma.mediaAsset.findUnique({ where: { id: String(req.params.id) } })
   if (!media) throw new HttpError(404, 'Media not found.')
@@ -830,6 +852,37 @@ api.post('/ai/caption', requireSession, rateLimit('ai-caption', 30, 60 * 60_000)
 
 api.get('/content', requireSession, async (req, res) => {
   res.json(await listContent(req))
+})
+
+const bulkContentTypes = z.enum(['reel', 'story', 'post', 'image'])
+
+function formatsForTypes(types: Array<'reel' | 'story' | 'post' | 'image'>) {
+  const map = {
+    reel: ['instagram_reel', 'facebook_reel'],
+    story: ['instagram_story', 'facebook_story'],
+    image: ['instagram_feed_image', 'facebook_image'],
+    post: ['instagram_feed_video', 'facebook_video'],
+  } as const
+  return types.flatMap((type) => [...map[type]])
+}
+
+api.post('/content/bulk-delete', requireSession, async (req, res) => {
+  const parsed = z.object({ types: z.array(bulkContentTypes).min(1).max(4).optional() }).safeParse(req.body ?? {})
+  if (!parsed.success) throw new HttpError(400, 'Choose which items to delete.')
+  const formats = parsed.data.types?.length ? formatsForTypes(parsed.data.types) : null
+  const items = await prisma.content.findMany({
+    where: {
+      status: { not: 'processing' },
+      ...(formats ? { OR: [{ format: { in: formats } }, { destinations: { some: { format: { in: formats } } } }] } : {}),
+    },
+    include: { destinations: true },
+  })
+  for (const item of items) {
+    for (const publication of item.destinations) await removePublicationJob(publication.id)
+    await prisma.content.delete({ where: { id: item.id } })
+    await audit('content.delete', 'Content', item.id, 'Removed from a bulk delete in the workspace. Live posts were left online.')
+  }
+  res.json({ ok: true, deleted: items.length })
 })
 
 api.get('/content/:id', requireSession, async (req, res) => {
