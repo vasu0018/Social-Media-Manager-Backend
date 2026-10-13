@@ -576,6 +576,23 @@ api.delete('/social-accounts/:id', requireSession, async (req, res) => {
   res.json({ ok: true, removed: true })
 })
 
+api.post('/accounts/:id/delete', requireSession, async (req, res) => {
+  const account = await prisma.socialAccount.findUnique({ where: { id: String(req.params.id) } })
+  if (!account) throw new HttpError(404, 'Account not found.')
+  if (account.connected) throw new HttpError(400, 'Disconnect this account before deleting it.')
+  const destinations = await prisma.contentDestination.findMany({ where: { accountId: account.id }, select: { id: true, contentId: true, status: true } })
+  if (destinations.some((destination) => destination.status === 'processing')) {
+    throw new HttpError(409, 'A post for this account is publishing right now. Wait for it to finish, then delete the account.')
+  }
+  for (const destination of destinations) await removePublicationJob(destination.id)
+  await prisma.contentDestination.deleteMany({ where: { accountId: account.id } })
+  await prisma.socialAccount.delete({ where: { id: account.id } })
+  const contentIds = [...new Set(destinations.map((destination) => destination.contentId))]
+  for (const contentId of contentIds) await rollupContent(contentId)
+  await audit('account.delete', 'SocialAccount', account.id, `${account.name} deleted with ${destinations.length} linked publication${destinations.length === 1 ? '' : 's'}.`)
+  res.json({ ok: true, removedPublications: destinations.length })
+})
+
 api.post('/accounts/:id/disconnect', requireSession, async (req, res) => {
   const account = await prisma.socialAccount.findUnique({ where: { id: String(req.params.id) } })
   if (!account) throw new HttpError(404, 'Account not found.')
