@@ -751,8 +751,8 @@ export const metaProvider = {
   },
   async inspect(token: string, instagramLogin = false) {
     if (instagramLogin) {
-      await graph('/me?fields=user_id,username', token, { host: instagramHost })
-      return { tokenStatus: 'valid', scopes: [], tokenExpiresAt: null, dataAccessExpiresAt: null }
+      const profile = await graph<{ account_type?: string }>('/me?fields=user_id,username,account_type', token, { host: instagramHost })
+      return { tokenStatus: 'valid', scopes: [], tokenExpiresAt: null, dataAccessExpiresAt: null, accountType: profile.account_type ?? null }
     }
     const debug = await debugToken(token)
     return {

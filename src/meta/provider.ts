@@ -10,6 +10,7 @@ export type SocialProvider = {
     scopes: string[]
     tokenExpiresAt: Date | null
     dataAccessExpiresAt: Date | null
+    accountType?: string | null
   }>
   publish: (input: PublishInput) => Promise<{ externalId: string; warning?: string }>
   searchAudio: (token: string, igUserId: string, audioType: 'music' | 'original_sound', query: string) => Promise<InstagramAudio[]>

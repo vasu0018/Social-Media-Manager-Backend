@@ -47,7 +47,7 @@ export function storySupport(account: SocialAccount | null, format: ContentForma
   const scopes = scopesOf(account)
   if (format === 'instagram_story') {
     if (account.accountType === 'MEDIA_CREATOR') {
-      return { supported: false, message: 'Not supported by current API integration. Instagram Stories publish only to Business accounts.' }
+      return { supported: false, message: 'Instagram reports this as a Creator account. Meta allows Story publishing only for Business accounts. In Instagram, switch it to a Business account, then press Refresh on Social Accounts.' }
     }
     if (account.accountType !== 'BUSINESS') {
       return { supported: false, message: 'Not supported by current API integration. Instagram Stories require a confirmed Business account.' }

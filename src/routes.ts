@@ -603,6 +603,7 @@ api.post('/accounts/:id/refresh', requireSession, async (req, res) => {
       where: { id: account.id },
       data: {
         tokenStatus: inspection.tokenStatus,
+        ...(inspection.accountType ? { accountType: inspection.accountType } : {}),
         grantedScopes: inspection.scopes.length > 0 ? JSON.stringify(inspection.scopes) : account.grantedScopes,
         tokenExpiresAt: inspection.tokenExpiresAt,
         dataAccessExpiresAt: inspection.dataAccessExpiresAt,
