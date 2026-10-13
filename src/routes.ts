@@ -14,7 +14,7 @@ import { socialProvider } from './meta/provider.js'
 import { suggestCaption } from './ai/caption.js'
 import { assertCanPublish, pageTokenCipher, permalinkFor, rollupContent, taskList } from './publish.js'
 import { probeBuffer } from './probe.js'
-import { prepareStoryImage, prepareVideo } from './transcode.js'
+import { mixSong, prepareStoryImage, prepareVideo } from './transcode.js'
 import { enqueuePublication, removePublicationJob } from './queue.js'
 import { guardRequest, rateLimit, redact } from './security.js'
 import { sharedMediaUrl, storage } from './storage.js'
@@ -689,6 +689,55 @@ api.post(['/media', '/media/upload'], requireSession, rateLimit('upload', 40, 60
   const key = created.id
   await storage.save(key, body, probe.mime)
   const media = await prisma.mediaAsset.update({ where: { id: created.id }, data: { storageKey: key } })
+  res.status(201).json({ media: await presentMedia(media), errors })
+})
+
+const songMixSchema = z.object({
+  format: z.enum(contentFormats as unknown as [ContentFormat, ...ContentFormat[]]).optional(),
+  startSec: z.coerce.number().min(0).max(3600).default(0),
+  songVolume: z.coerce.number().int().min(1).max(100).default(100),
+  originalVolume: z.coerce.number().int().min(0).max(100).default(30),
+  lengthSec: z.coerce.number().int().min(3).max(60).default(15),
+})
+
+api.post('/media/:id/song', requireSession, rateLimit('upload', 40, 60 * 60_000), upload.single('file'), async (req, res) => {
+  const source = await prisma.mediaAsset.findUnique({ where: { id: String(req.params.id) } })
+  if (!source) throw new HttpError(404, 'That file is no longer in the library. Upload it again.')
+  const file = req.file
+  if (!file) throw new HttpError(400, 'Choose a song file.')
+  if (file.size > 50 * 1024 * 1024) throw new HttpError(400, 'The song file must be 50 MB or smaller.')
+  if (!file.mimetype.startsWith('audio/') && !/\.(mp3|m4a|aac|wav|ogg)$/i.test(file.originalname)) {
+    throw new HttpError(400, 'Choose an MP3, M4A, AAC, or WAV song file.')
+  }
+  const parsed = songMixSchema.safeParse(req.body ?? {})
+  if (!parsed.success) throw new HttpError(400, 'Check the song start time and volume.')
+  const { format, ...mix } = parsed.data
+  if (source.kind === 'image' && format && !format.endsWith('story')) {
+    throw new HttpError(400, 'A song can be added to a photo only for a story. Upload a video for a reel or feed video.')
+  }
+  const body = await mixSong({
+    body: await storage.open(source.storageKey).read(),
+    kind: source.kind === 'video' ? 'video' : 'image',
+    durationMs: source.durationMs,
+  }, file.buffer, mix)
+  const name = `${source.name.replace(/\.[^.]+$/, '')} + ${file.originalname.replace(/\.[^.]+$/, '')}.mp4`.slice(0, 180)
+  const probe = probeBuffer(body, 'video/mp4', name)
+  const errors = format ? validateProbe(format, probe) : []
+  const created = await prisma.mediaAsset.create({
+    data: {
+      name,
+      mime: probe.mime,
+      kind: probe.kind,
+      bytes: probe.bytes,
+      width: probe.width,
+      height: probe.height,
+      durationMs: probe.durationMs,
+      storageKey: 'pending',
+    },
+  })
+  await storage.save(created.id, body, probe.mime)
+  const media = await prisma.mediaAsset.update({ where: { id: created.id }, data: { storageKey: created.id } })
+  await audit('media.song', 'MediaAsset', media.id, `Mixed ${file.originalname} into ${source.name}`)
   res.status(201).json({ media: await presentMedia(media), errors })
 })
 

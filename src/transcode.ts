@@ -101,6 +101,68 @@ function audioFits(audio: NonNullable<StreamInfo['audio']>) {
     && (audio.kbps == null || audio.kbps <= 128)
 }
 
+export type SongMix = {
+  startSec: number
+  songVolume: number
+  originalVolume: number
+  lengthSec: number
+}
+
+const storyFrame = '[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:5[bg];'
+  + '[0:v]scale=1080:1920:force_original_aspect_ratio=decrease[fg];'
+  + '[bg][fg]overlay=(W-w)/2:(H-h)/2,format=yuv420p[v]'
+
+export async function mixSong(media: { body: Buffer; kind: 'image' | 'video'; durationMs: number | null }, song: Buffer, mix: SongMix) {
+  if (!ffmpegPath) throw new HttpError(503, 'Songs cannot be added because ffmpeg is not installed on the server.')
+  const dir = await mkdtemp(path.join(tmpdir(), 'song-'))
+  const source = path.join(dir, media.kind === 'video' ? 'in.mp4' : 'in.img')
+  const track = path.join(dir, 'song.audio')
+  const target = path.join(dir, 'out.mp4')
+  try {
+    await writeFile(source, media.body)
+    await writeFile(track, song)
+    const length = media.kind === 'video' && media.durationMs ? media.durationMs / 1000 : mix.lengthSec
+    const fadeAt = Math.max(0, length - 1.5).toFixed(2)
+    const songChain = `[1:a]volume=${(mix.songVolume / 100).toFixed(2)},afade=t=out:st=${fadeAt}:d=1.5`
+    const songInput = ['-ss', String(mix.startSec), '-i', track]
+    const audioOut = ['-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-ac', '2']
+    if (media.kind === 'video') {
+      const info = await inspectVideo(source)
+      if (!info.video) throw new HttpError(400, 'This video has no picture track.')
+      const keepOriginal = info.audio != null && mix.originalVolume > 0
+      const filter = keepOriginal
+        ? `${songChain}[s];[0:a]volume=${(mix.originalVolume / 100).toFixed(2)}[o];[o][s]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a]`
+        : `${songChain}[a]`
+      await runFfmpeg([
+        '-y', '-i', source, ...songInput,
+        '-filter_complex', filter,
+        '-map', '0:v:0', '-map', '[a]',
+        '-c:v', 'copy', ...audioOut,
+        '-t', length.toFixed(2),
+        '-movflags', '+faststart',
+        target,
+      ])
+    } else {
+      await runFfmpeg([
+        '-y', '-loop', '1', '-framerate', '30', '-i', source, ...songInput,
+        '-filter_complex', `${storyFrame};${songChain}[a]`,
+        '-map', '[v]', '-map', '[a]',
+        '-c:v', 'libx264', '-profile:v', 'high', '-preset', 'veryfast', '-crf', '23', '-tune', 'stillimage', '-r', '30',
+        ...audioOut,
+        '-t', length.toFixed(2),
+        '-movflags', '+faststart',
+        target,
+      ])
+    }
+    return await readFile(target)
+  } catch (error) {
+    if (error instanceof HttpError) throw error
+    throw new HttpError(400, 'The song could not be added. Use an MP3, M4A, AAC, or WAV file and try again.')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+}
+
 export async function prepareVideo(input: Buffer): Promise<{ body: Buffer; changed: boolean }> {
   if (input.toString('ascii', 4, 8) !== 'ftyp' || !ffmpegPath) return { body: input, changed: false }
   const dir = await mkdtemp(path.join(tmpdir(), 'reel-'))
