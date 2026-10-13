@@ -201,3 +201,12 @@ model Notification {
 
   @@index([readAt, createdAt])
 }
+
+model SavedPlace {
+  id        String   @id
+  name      String
+  address   String?
+  isDefault Boolean  @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}

@@ -8,7 +8,7 @@ import { decryptSecret, encryptSecret, randomId, signaturesMatch, signValue } fr
 import { prisma } from './db.js'
 import { coarseType, contentFormats, HttpError, platformFor, validateProbe, type ContentFormat } from './domain.js'
 import { env, instagramConfigured, isDevelopment, metaConfigured } from './env.js'
-import { instagramErrorText, searchPlaces } from './meta/graph.js'
+import { instagramErrorText, placeReference, searchPlaces } from './meta/graph.js'
 import { publishOptionsSchema, readPublishOptions } from './publish-options.js'
 import { socialProvider } from './meta/provider.js'
 import { suggestCaption } from './ai/caption.js'
@@ -224,7 +224,7 @@ const contentSchema = z.object({
   publishOptions: publishOptionsSchema.optional(),
   format: z.enum(contentFormats).optional(),
   accountId: z.string().nullable().optional(),
-  destinations: z.array(destinationSchema).max(6).optional(),
+  destinations: z.array(destinationSchema).max(20).optional(),
   mediaId: z.string().nullable().optional(),
   action: z.enum(['draft', 'schedule', 'publish']),
   scheduledAt: z.string().nullable().optional(),
@@ -766,12 +766,16 @@ api.post('/media/bulk-delete', requireSession, async (req, res) => {
 api.delete('/media/:id', requireSession, async (req, res) => {
   const media = await prisma.mediaAsset.findUnique({ where: { id: String(req.params.id) } })
   if (!media) throw new HttpError(404, 'Media not found.')
-  const used = await prisma.content.count({
-    where: { mediaId: media.id, status: { in: ['scheduled', 'processing'] } },
+  const used = await prisma.content.findFirst({
+    where: { status: { in: ['scheduled', 'processing'] }, OR: [{ mediaId: media.id }, { coverMediaId: media.id }] },
+    select: { title: true },
   })
-  if (used > 0) throw new HttpError(400, 'This file is attached to scheduled content.')
-  await storage.open(media.storageKey).remove()
+  if (used) throw new HttpError(409, `This file is used by "${used.title}", which is scheduled or publishing. Turn off its auto-publish first, then delete the file.`)
+  await prisma.content.updateMany({ where: { mediaId: media.id }, data: { mediaId: null } })
+  await prisma.content.updateMany({ where: { coverMediaId: media.id }, data: { coverMediaId: null } })
+  await storage.open(media.storageKey).remove().catch(() => undefined)
   await prisma.mediaAsset.delete({ where: { id: media.id } })
+  await audit('media.delete', 'MediaAsset', media.id, media.name)
   res.json({ ok: true })
 })
 
@@ -896,10 +900,72 @@ api.get('/places', requireSession, rateLimit('places', 120, 60 * 60_000), async 
       if (cipher) sources.push({ token: decryptSecret(cipher), pageId: account.pageId && account.pageId !== account.externalId ? account.pageId : null })
     }
   }
+  const link = Boolean(query && placeReference(query))
+  const saved = link ? [] : await prisma.savedPlace.findMany({
+    where: query ? { name: { contains: query, mode: 'insensitive' } } : {},
+    orderBy: [{ isDefault: 'desc' }, { name: 'asc' }],
+    take: 25,
+  })
+  const places = saved.map((place) => ({ id: place.id, name: place.name, address: place.address, saved: true, isDefault: place.isDefault }))
   if (sources.length === 0) {
-    return res.json({ places: [], searchError: 'Connect a Facebook Page first. Meta looks up places through a Facebook connection.' })
+    return res.json({ places, searchError: link || places.length === 0 ? 'Connect a Facebook Page first. Meta looks up places through a Facebook connection.' : null })
   }
-  res.json(await searchPlaces(sources, query))
+  const found = await searchPlaces(sources, query)
+  const savedIds = new Set(places.map((place) => place.id))
+  for (const place of found.places) {
+    if (!savedIds.has(place.id)) places.push({ ...place, saved: false, isDefault: false })
+  }
+  let searchError = found.searchError
+  if (!link) {
+    searchError = places.length > 0 || !query
+      ? null
+      : `No saved place matches “${query}”. Paste the Facebook link of the place once and it will be saved here for next time.`
+  }
+  res.json({ places: places.slice(0, 25), searchError })
+})
+
+const savedPlaceSchema = z.object({
+  id: z.string().regex(/^\d{5,30}$/, 'The place number is not valid.'),
+  name: z.string().trim().min(1, 'Give the place a name.').max(120),
+  address: z.string().trim().max(300).nullable().optional(),
+})
+
+api.post('/places', requireSession, async (req, res) => {
+  const parsed = savedPlaceSchema.safeParse(req.body)
+  if (!parsed.success) throw new HttpError(400, parsed.error.issues[0]?.message ?? 'The place is not valid.')
+  const { id, name, address } = parsed.data
+  const place = await prisma.savedPlace.upsert({
+    where: { id },
+    create: { id, name, address: address ?? null },
+    update: { name, ...(address ? { address } : {}) },
+  })
+  await audit('place.save', 'SavedPlace', place.id, place.name)
+  res.json({ id: place.id, name: place.name, address: place.address, saved: true, isDefault: place.isDefault })
+})
+
+api.get('/places/default', requireSession, async (_req, res) => {
+  const place = await prisma.savedPlace.findFirst({ where: { isDefault: true } })
+  res.json({ place: place ? { id: place.id, name: place.name, address: place.address } : null })
+})
+
+api.post('/places/:id/default', requireSession, async (req, res) => {
+  const id = String(req.params.id)
+  const place = await prisma.savedPlace.findUnique({ where: { id } })
+  if (!place) throw new HttpError(404, 'This place is no longer saved.')
+  const isDefault = !place.isDefault
+  await prisma.$transaction([
+    prisma.savedPlace.updateMany({ where: { isDefault: true }, data: { isDefault: false } }),
+    ...(isDefault ? [prisma.savedPlace.update({ where: { id }, data: { isDefault: true } })] : []),
+  ])
+  await audit(isDefault ? 'place.default' : 'place.undefault', 'SavedPlace', id, place.name)
+  res.json({ ok: true, isDefault })
+})
+
+api.post('/places/:id/delete', requireSession, async (req, res) => {
+  const id = String(req.params.id)
+  await prisma.savedPlace.deleteMany({ where: { id } })
+  await audit('place.delete', 'SavedPlace', id)
+  res.json({ ok: true })
 })
 
 api.post('/ai/caption', requireSession, rateLimit('ai-caption', 30, 60 * 60_000), async (req, res) => {
@@ -1012,9 +1078,9 @@ api.post('/content', requireSession, async (req, res) => {
     throw new HttpError(400, 'A song from Instagram can be attached to an Instagram Reel. Stories and Facebook posts keep the audio already inside the file.')
   }
   if (input.audio) {
-    const instagram = accounts.find((account) => destinations.some((destination) => destination.accountId === account.id && songFormats.has(destination.format)))
-    if (instagram && !pageTokenCipher(instagram)) {
-      throw new HttpError(400, 'Connect the Facebook Page that owns this Instagram account before attaching a song.')
+    const withoutPage = accounts.find((account) => !pageTokenCipher(account) && destinations.some((destination) => destination.accountId === account.id && songFormats.has(destination.format)))
+    if (withoutPage) {
+      throw new HttpError(400, `${withoutPage.name} is connected without its Facebook Page, so Instagram will not attach the song there. Reconnect that account through its Facebook Page, or untick it.`)
     }
   }
   const coverFormats = new Set(['instagram_reel', 'instagram_feed_video', 'facebook_reel', 'facebook_video'])
@@ -1091,7 +1157,7 @@ api.patch('/content/:id', requireSession, async (req, res) => {
       audioVolume: z.number().int().min(1).max(100).default(100),
       videoVolume: z.number().int().min(1).max(100).default(60),
     }).nullable().optional(),
-    destinations: z.array(destinationSchema).max(6).optional(),
+    destinations: z.array(destinationSchema).max(20).optional(),
     publishOptions: publishOptionsSchema.optional(),
   }).safeParse(req.body)
   if (!parsed.success) throw new HttpError(400, parsed.error.issues[0]?.message && parsed.error.issues[0].path.includes('publishOptions') ? parsed.error.issues[0].message : 'Check the content fields.')
@@ -1122,8 +1188,12 @@ api.patch('/content/:id', requireSession, async (req, res) => {
       && item.destinations.every((destination) => patch.destinations?.some((next) => next.accountId === destination.accountId && next.format === destination.format))
     if (!same) {
       if (scheduled) throw new HttpError(409, 'Cancel the schedule before changing Instagram or Facebook on this item.')
+      const seen = new Set<string>()
       for (const destination of patch.destinations) {
         if (platformFor(destination.format) !== destination.platform) throw new HttpError(400, 'Each destination must use a format for its own platform.')
+        const key = `${destination.accountId}:${destination.format}`
+        if (seen.has(key)) throw new HttpError(400, 'Each account can only be selected once for a format.')
+        seen.add(key)
         const account = await prisma.socialAccount.findUnique({ where: { id: destination.accountId } })
         if (!account || !account.connected) throw new HttpError(400, 'That account is no longer connected.')
       }

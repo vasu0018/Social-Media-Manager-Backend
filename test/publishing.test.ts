@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { after, before, describe, it } from 'node:test'
-import { zonedToUtc } from '../../Client/src/lib/time.ts'
+import { zonedToUtc } from '../../Social-Media-Manager-Frontend/src/lib/time.ts'
 import { createApp } from '../src/app.js'
 import { encryptSecret } from '../src/crypto.js'
 import { prisma } from '../src/db.js'
@@ -65,7 +65,7 @@ describe('publishing rules', () => {
   it('rejects Creator stories and expired tokens', () => {
     const creator = storySupport(account({ accountType: 'MEDIA_CREATOR' }), 'instagram_story')
     assert.equal(creator.supported, false)
-    assert.match(creator.message, /Not supported by current API integration/)
+    assert.match(creator.message, /Story publishing only for Business accounts/)
     const business = storySupport(account(), 'instagram_story')
     assert.equal(business.supported, true)
     assert.throws(() => assertCanPublish(account({ tokenStatus: 'expired' }), 'instagram_reel', null), /expired or was revoked/)

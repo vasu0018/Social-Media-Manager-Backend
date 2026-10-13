@@ -1,0 +1,1 @@
+ALTER TABLE "SavedPlace" ADD COLUMN "isDefault" BOOLEAN NOT NULL DEFAULT false;

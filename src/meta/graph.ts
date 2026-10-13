@@ -292,7 +292,7 @@ function placeResult(node: PlaceNode): PlaceResult | null {
   return { id: node.id, name: node.name, address: where || null }
 }
 
-function placeReference(query: string) {
+export function placeReference(query: string) {
   if (/^\d{5,30}$/.test(query)) return query
   try {
     const url = new URL(query)
@@ -475,8 +475,20 @@ async function publishInstagram(input: PublishInput) {
     fields.upload_type = 'resumable'
   }
 
+  const warnings: string[] = []
+  const startContainer = async () => {
+    try {
+      return await graph<{ id: string }>(`/${input.igId}/media`, input.token, { method: 'POST', body: form(fields), host })
+    } catch (error) {
+      if (!fields.location_id || !(error instanceof HttpError) || error.status !== 400 || (error.code && instagramErrorText(error.code))) throw error
+      delete fields.location_id
+      const container = await graph<{ id: string }>(`/${input.igId}/media`, input.token, { method: 'POST', body: form(fields), host })
+      warnings.push(`Published without the location "${options.location?.name}", because Instagram did not accept that place. Paste the place link again in Add location.`)
+      return container
+    }
+  }
   const createContainer = async () => {
-    const container = await graph<{ id: string }>(`/${input.igId}/media`, input.token, { method: 'POST', body: form(fields), host })
+    const container = await startContainer()
     if (fields.upload_type === 'resumable') await uploadInstagramVideo(container.id, input.token, input.bytes)
     await waitForContainer(container.id, input.token, host)
     return container.id
@@ -495,7 +507,6 @@ async function publishInstagram(input: PublishInput) {
     body: form({ creation_id: containerId }),
     host,
   })
-  const warnings: string[] = []
   if (input.firstComment && input.format !== 'instagram_story') {
     try {
       await graph(`/${published.id}/comments`, input.token, { method: 'POST', body: form({ message: input.firstComment }), host })
@@ -536,14 +547,26 @@ async function publishFacebook(input: PublishInput) {
   const targeting = facebookTargeting(options)
 
   if (input.format === 'facebook_image') {
-    const body = new FormData()
-    if (text) body.set('caption', text)
-    if (options.place) body.set('place', options.place.id)
-    if (targeting) body.set('targeting', targeting)
-    if (options.altText) body.set('alt_text_custom', options.altText)
-    body.set('source', file)
-    const result = await graph<{ id: string }>(`/${input.pageId}/photos`, input.token, { method: 'POST', body })
-    return { externalId: result.id }
+    const photo = (place: boolean) => {
+      const body = new FormData()
+      if (text) body.set('caption', text)
+      if (place && options.place) body.set('place', options.place.id)
+      if (targeting) body.set('targeting', targeting)
+      if (options.altText) body.set('alt_text_custom', options.altText)
+      body.set('source', file)
+      return graph<{ id: string }>(`/${input.pageId}/photos`, input.token, { method: 'POST', body })
+    }
+    try {
+      const result = await photo(true)
+      return { externalId: result.id }
+    } catch (error) {
+      if (!options.place || !(error instanceof HttpError) || error.status !== 400) throw error
+      const result = await photo(false)
+      return {
+        externalId: result.id,
+        warning: `Published without the check-in "${options.place.name}", because Facebook did not accept that place. Paste the place link again in Check in.`,
+      }
+    }
   }
 
   if (input.format === 'facebook_video') {
