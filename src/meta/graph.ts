@@ -307,6 +307,20 @@ function placeReference(query: string) {
   }
 }
 
+function nameFromLink(query: string, id: string) {
+  try {
+    const parts = new URL(query).pathname.split('/').filter(Boolean).map((part) => decodeURIComponent(part))
+    const label = parts
+      .map((part) => part.replace(id, '').replace(/[-_]+/g, ' ').trim())
+      .filter((part) => part && !/^(pages|places|profile\.php)$/i.test(part))
+      .pop()
+    if (label) return label.slice(0, 120)
+  } catch {
+    // Not a link.
+  }
+  return `Facebook place ${id}`
+}
+
 const placeFields = 'id,name,link,location{street,city,state,country,zip,latitude,longitude}'
 
 export async function searchPlaces(sources: Array<{ token: string; pageId: string | null }>, query: string) {
@@ -326,7 +340,12 @@ export async function searchPlaces(sources: Array<{ token: string; pageId: strin
         // Try the next connection.
       }
     }
-    if (found.size === 0) searchError = 'Meta did not return a location for that link. The Page may have no address, or reading Pages you do not manage needs the Page Public Metadata Access feature for this app.'
+    if (found.size === 0 && /^\d+$/.test(reference)) {
+      found.set(reference, { id: reference, name: nameFromLink(query, reference), address: null })
+      searchError = 'Meta would not show the details of this place to the app, so it is used exactly as pasted. Instagram and Facebook check it when the post is published.'
+    } else if (found.size === 0) {
+      searchError = 'That link has no place number, and Meta would not look up the name. Open the place on Facebook and copy a link that ends in its number, for example facebook.com/pages/Mumbai/1234567890.'
+    }
   } else if (query.length >= 2) {
     let lastError = ''
     for (const source of sources) {
@@ -340,7 +359,7 @@ export async function searchPlaces(sources: Array<{ token: string; pageId: strin
       }
     }
     if (lastError) {
-      searchError = 'Meta did not allow a place search for this app (the Page Public Metadata Access feature is needed). Paste the Facebook link of the place instead.'
+      searchError = 'Searching places by name needs Meta to approve the Page Public Metadata Access feature for this app. Until then, open the place on Facebook and paste its link here (a link that ends in a number, for example facebook.com/pages/Mumbai/1234567890).'
     }
   }
   const searchBlocked = Boolean(searchError) && !reference
