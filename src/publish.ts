@@ -3,6 +3,7 @@ import { prisma } from './db.js'
 import { HttpError, platformFor, validateProbe, type ContentFormat } from './domain.js'
 import { socialProvider } from './meta/provider.js'
 import { publicBaseIsLocal, remoteCopyEnabled, storage } from './storage.js'
+import { facebookOptionsFor, instagramOptionsFor, readPublishOptions } from './publish-options.js'
 import { prepareVideo } from './transcode.js'
 
 export class PermanentPublishError extends HttpError {
@@ -274,6 +275,7 @@ async function publishClaimed(existing: Loaded) {
   })
   if (errors.length > 0) throw new PermanentPublishError(400, errors[0] ?? 'This file does not meet the platform requirements.')
   const songOnInstagram = Boolean(content.audioId) && (format === 'instagram_reel' || format === 'instagram_feed_video')
+  const options = readPublishOptions(content.publishOptions)
   let publicUrl: string | null = null
   if (content.media.kind === 'image' && format.startsWith('instagram')) {
     if (!remoteCopyEnabled && publicBaseIsLocal()) {
@@ -338,6 +340,8 @@ async function publishClaimed(existing: Loaded) {
     thumbOffsetMs,
     coverBytes,
     coverMime,
+    instagram: format.startsWith('instagram') ? instagramOptionsFor(format, options) : undefined,
+    facebook: format.startsWith('facebook') ? facebookOptionsFor(format, options) : undefined,
   })
   await prisma.contentDestination.update({
     where: { id: existing.id },

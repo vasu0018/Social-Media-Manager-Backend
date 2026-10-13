@@ -97,6 +97,7 @@ model Content {
   coverMediaId  String?
   coverMedia    MediaAsset?          @relation("ContentCover", fields: [coverMediaId], references: [id], onDelete: SetNull)
   thumbOffsetMs Int?
+  publishOptions String              @default("{}")
   format        String
   status        String
   timezone      String               @default("UTC")

@@ -1,5 +1,6 @@
 import { env, instagramConfigured, metaConfigured } from '../env.js'
 import { HttpError, type ContentFormat } from '../domain.js'
+import { facebookTargeting, type FacebookOptions, type InstagramOptions } from '../publish-options.js'
 import { redact } from '../security.js'
 
 export type DiscoveredAccount = {
@@ -276,6 +277,87 @@ function missingPageMessage(debug: DebugData | null) {
   return 'This Facebook login does not manage a Page. Log in as the person who manages the Page, and select that Page when Facebook asks.'
 }
 
+type PlaceNode = {
+  id: string
+  name?: string
+  link?: string
+  location?: { street?: string; city?: string; state?: string; country?: string; zip?: string; latitude?: number; longitude?: number }
+}
+
+export type PlaceResult = { id: string; name: string; address: string | null }
+
+function placeResult(node: PlaceNode): PlaceResult | null {
+  if (!node.id || !node.name || !node.location) return null
+  const where = [node.location.street, node.location.city, node.location.state, node.location.country].filter(Boolean).join(', ')
+  return { id: node.id, name: node.name, address: where || null }
+}
+
+function placeReference(query: string) {
+  if (/^\d{5,30}$/.test(query)) return query
+  try {
+    const url = new URL(query)
+    if (!/(^|\.)facebook\.com$/.test(url.hostname)) return null
+    const id = url.searchParams.get('id')
+    if (id && /^\d+$/.test(id)) return id
+    const slug = url.pathname.split('/').filter(Boolean).pop() ?? ''
+    const numeric = slug.match(/(\d{5,30})$/)?.[1]
+    return numeric ?? (/^[A-Za-z0-9.]{3,80}$/.test(slug) ? slug : null)
+  } catch {
+    return null
+  }
+}
+
+const placeFields = 'id,name,link,location{street,city,state,country,zip,latitude,longitude}'
+
+export async function searchPlaces(sources: Array<{ token: string; pageId: string | null }>, query: string) {
+  const found = new Map<string, PlaceResult>()
+  let searchError: string | null = null
+  const add = (node: PlaceNode) => {
+    const place = placeResult(node)
+    if (place && !found.has(place.id)) found.set(place.id, place)
+  }
+  const reference = query ? placeReference(query) : null
+  if (reference) {
+    for (const source of sources) {
+      try {
+        add(await graph<PlaceNode>(`/${encodeURIComponent(reference)}?fields=${encodeURIComponent(placeFields)}`, source.token))
+        break
+      } catch {
+        // Try the next connection.
+      }
+    }
+    if (found.size === 0) searchError = 'Meta did not return a location for that link. The Page may have no address, or reading Pages you do not manage needs the Page Public Metadata Access feature for this app.'
+  } else if (query.length >= 2) {
+    let lastError = ''
+    for (const source of sources) {
+      try {
+        const result = await graph<{ data?: PlaceNode[] }>(`/pages/search?q=${encodeURIComponent(query)}&fields=${encodeURIComponent(placeFields)}&limit=25`, source.token)
+        for (const node of result.data ?? []) add(node)
+        lastError = ''
+        break
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : ''
+      }
+    }
+    if (lastError) {
+      searchError = 'Meta did not allow a place search for this app (the Page Public Metadata Access feature is needed). Paste the Facebook link of the place instead.'
+    }
+  }
+  const searchBlocked = Boolean(searchError) && !reference
+  const lowered = query.toLowerCase()
+  for (const source of sources) {
+    if (!source.pageId) continue
+    try {
+      const page = await graph<PlaceNode>(`/${source.pageId}?fields=${encodeURIComponent(placeFields)}`, source.token)
+      if (!lowered || reference || page.name?.toLowerCase().includes(lowered) || page.location?.city?.toLowerCase().includes(lowered)) add(page)
+    } catch {
+      // This Page has no readable location.
+    }
+  }
+  if (searchBlocked && found.size > 0) searchError += ' Your own Pages with an address are listed above.'
+  return { places: [...found.values()].slice(0, 25), searchError }
+}
+
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
@@ -347,6 +429,18 @@ async function publishInstagram(input: PublishInput) {
   else if (reel && input.kind === 'video' && input.thumbOffsetMs && input.thumbOffsetMs > 0) {
     fields.thumb_offset = String(Math.round(input.thumbOffsetMs))
   }
+  const options = input.instagram ?? {}
+  if (options.location) fields.location_id = options.location.id
+  if (options.userTags && options.userTags.length > 0) {
+    fields.user_tags = JSON.stringify(options.userTags.map((tag) => input.kind === 'image'
+      ? { username: tag.username, x: tag.x ?? 0.5, y: tag.y ?? 0.5 }
+      : { username: tag.username }))
+  }
+  if (options.collaborators && options.collaborators.length > 0) fields.collaborators = JSON.stringify(options.collaborators)
+  if (options.altText) fields.alt_text = options.altText
+  if (input.format === 'instagram_reel' && options.shareToFeed !== undefined) fields.share_to_feed = String(options.shareToFeed)
+  if (reel && options.trialReel && options.trialReel !== 'off') fields.trial_params = JSON.stringify({ graduation_strategy: options.trialReel })
+  if (reel && options.audioName && !input.audio) fields.audio_name = options.audioName
 
   if (input.kind === 'image') {
     if (!input.publicUrl) {
@@ -382,15 +476,24 @@ async function publishInstagram(input: PublishInput) {
     body: form({ creation_id: containerId }),
     host,
   })
+  const warnings: string[] = []
   if (input.firstComment && input.format !== 'instagram_story') {
     try {
       await graph(`/${published.id}/comments`, input.token, { method: 'POST', body: form({ message: input.firstComment }), host })
     } catch (error) {
       const message = error instanceof Error ? error.message : 'The first comment was not added.'
-      return { externalId: published.id, warning: `Published, but the first comment was not added. ${message}` }
+      warnings.push(`Published, but the first comment was not added. ${message}`)
     }
   }
-  return { externalId: published.id }
+  if (options.commentsOff) {
+    try {
+      await graph(`/${published.id}`, input.token, { method: 'POST', body: form({ comment_enabled: 'false' }), host })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Instagram did not turn off comments.'
+      warnings.push(`Published, but commenting is still on. Turn it off in the Instagram app. ${message}`)
+    }
+  }
+  return { externalId: published.id, warning: warnings.length > 0 ? warnings.join(' ') : undefined }
 }
 
 async function uploadFacebookBinary(uploadUrl: string, token: string, bytes: Buffer) {
@@ -410,9 +513,15 @@ async function publishFacebook(input: PublishInput) {
   const text = captionFor(input.format, input.caption, input.hashtags)
   const file = new File([new Uint8Array(input.bytes)], input.kind === 'image' ? 'upload.jpg' : 'upload.mp4', { type: input.mime })
 
+  const options = input.facebook ?? {}
+  const targeting = facebookTargeting(options)
+
   if (input.format === 'facebook_image') {
     const body = new FormData()
     if (text) body.set('caption', text)
+    if (options.place) body.set('place', options.place.id)
+    if (targeting) body.set('targeting', targeting)
+    if (options.altText) body.set('alt_text_custom', options.altText)
     body.set('source', file)
     const result = await graph<{ id: string }>(`/${input.pageId}/photos`, input.token, { method: 'POST', body })
     return { externalId: result.id }
@@ -421,6 +530,8 @@ async function publishFacebook(input: PublishInput) {
   if (input.format === 'facebook_video') {
     const body = new FormData()
     if (text) body.set('description', text)
+    if (options.videoTitle) body.set('title', options.videoTitle)
+    if (targeting) body.set('targeting', targeting)
     body.set('source', file)
     const result = await graph<{ id: string }>(`/${input.pageId}/videos`, input.token, {
       method: 'POST',
@@ -480,6 +591,8 @@ export type PublishInput = {
   thumbOffsetMs?: number | null
   coverBytes?: Buffer | null
   coverMime?: string | null
+  instagram?: InstagramOptions
+  facebook?: FacebookOptions
 }
 
 async function preferFacebookCover(videoId: string, input: PublishInput) {

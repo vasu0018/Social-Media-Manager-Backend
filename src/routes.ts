@@ -1,4 +1,4 @@
-﻿import { createHash, timingSafeEqual } from 'node:crypto'
+import { createHash, timingSafeEqual } from 'node:crypto'
 import type { MediaAsset, Prisma, SocialAccount } from '@prisma/client'
 import type { NextFunction, Request, Response } from 'express'
 import { Router } from 'express'
@@ -8,7 +8,8 @@ import { decryptSecret, encryptSecret, randomId, signaturesMatch, signValue } fr
 import { prisma } from './db.js'
 import { coarseType, contentFormats, HttpError, platformFor, validateProbe, type ContentFormat } from './domain.js'
 import { env, instagramConfigured, isDevelopment, metaConfigured } from './env.js'
-import { instagramErrorText } from './meta/graph.js'
+import { instagramErrorText, searchPlaces } from './meta/graph.js'
+import { publishOptionsSchema, readPublishOptions } from './publish-options.js'
 import { socialProvider } from './meta/provider.js'
 import { suggestCaption } from './ai/caption.js'
 import { assertCanPublish, pageTokenCipher, permalinkFor, rollupContent, taskList } from './publish.js'
@@ -129,6 +130,7 @@ async function presentContent(item: ContentRecord) {
     } : null,
     coverMediaId: item.coverMediaId,
     thumbOffsetMs: item.thumbOffsetMs,
+    publishOptions: readPublishOptions(item.publishOptions),
     format,
     type: coarseType(format),
     platforms: platforms.length > 0 ? platforms : [platformFor(format)],
@@ -219,6 +221,7 @@ const contentSchema = z.object({
   }).nullable().optional(),
   coverMediaId: z.string().trim().min(1).nullable().optional(),
   thumbOffsetMs: z.number().int().min(0).max(15 * 60 * 1000).nullable().optional(),
+  publishOptions: publishOptionsSchema.optional(),
   format: z.enum(contentFormats).optional(),
   accountId: z.string().nullable().optional(),
   destinations: z.array(destinationSchema).max(6).optional(),
@@ -881,6 +884,24 @@ api.get('/audio', requireSession, async (req, res) => {
   res.json({ tracks, available: true, needsPage: false, needsLink: false, reason: null })
 })
 
+api.get('/places', requireSession, rateLimit('places', 120, 60 * 60_000), async (req, res) => {
+  const query = typeof req.query.q === 'string' ? req.query.q.trim().slice(0, 200) : ''
+  const accounts = await prisma.socialAccount.findMany({ where: { connected: true } })
+  const sources: Array<{ token: string; pageId: string | null }> = []
+  for (const account of accounts) {
+    if (account.platform === 'facebook' && account.tokenCipher) {
+      sources.push({ token: decryptSecret(account.tokenCipher), pageId: account.pageId })
+    } else if (account.platform === 'instagram') {
+      const cipher = pageTokenCipher(account)
+      if (cipher) sources.push({ token: decryptSecret(cipher), pageId: account.pageId && account.pageId !== account.externalId ? account.pageId : null })
+    }
+  }
+  if (sources.length === 0) {
+    return res.json({ places: [], searchError: 'Connect a Facebook Page first. Meta looks up places through a Facebook connection.' })
+  }
+  res.json(await searchPlaces(sources, query))
+})
+
 api.post('/ai/caption', requireSession, rateLimit('ai-caption', 30, 60 * 60_000), async (req, res) => {
   const parsed = z.object({
     kind: z.enum(['reel', 'story', 'image', 'video']),
@@ -931,7 +952,10 @@ api.get('/content/:id', requireSession, async (req, res) => {
 
 api.post('/content', requireSession, async (req, res) => {
   const parsed = contentSchema.safeParse(req.body)
-  if (!parsed.success) throw new HttpError(400, 'Check the title, format, and schedule time.')
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0]
+    throw new HttpError(400, issue?.path.includes('publishOptions') ? issue.message : 'Check the title, format, and schedule time.')
+  }
   const input = parsed.data
   assertTimezone(input.timezone)
   const destinations = input.destinations?.length
@@ -1017,6 +1041,7 @@ api.post('/content', requireSession, async (req, res) => {
       videoVolume: input.audio?.videoVolume ?? 60,
       coverMediaId,
       thumbOffsetMs,
+      publishOptions: JSON.stringify(input.publishOptions ?? {}),
       format: destinations[0]?.format ?? input.format ?? 'instagram_reel',
       status: input.action === 'publish' ? 'processing' : input.action === 'schedule' ? 'scheduled' : 'draft',
       timezone: input.timezone,
@@ -1067,8 +1092,9 @@ api.patch('/content/:id', requireSession, async (req, res) => {
       videoVolume: z.number().int().min(1).max(100).default(60),
     }).nullable().optional(),
     destinations: z.array(destinationSchema).max(6).optional(),
+    publishOptions: publishOptionsSchema.optional(),
   }).safeParse(req.body)
-  if (!parsed.success) throw new HttpError(400, 'Check the content fields.')
+  if (!parsed.success) throw new HttpError(400, parsed.error.issues[0]?.message && parsed.error.issues[0].path.includes('publishOptions') ? parsed.error.issues[0].message : 'Check the content fields.')
   const patch = parsed.data
   await prisma.content.update({
     where: { id: item.id },
@@ -1087,6 +1113,7 @@ api.patch('/content/:id', requireSession, async (req, res) => {
       } : {}),
       ...(patch.coverMediaId !== undefined ? { coverMediaId: patch.coverMediaId } : {}),
       ...(patch.thumbOffsetMs !== undefined ? { thumbOffsetMs: patch.thumbOffsetMs } : {}),
+      ...(patch.publishOptions !== undefined ? { publishOptions: JSON.stringify(patch.publishOptions) } : {}),
     },
   })
   if (patch.destinations) {
@@ -1199,6 +1226,7 @@ api.post('/content/:id/duplicate', requireSession, async (req, res) => {
       videoVolume: existing.videoVolume,
       coverMediaId: existing.coverMediaId,
       thumbOffsetMs: existing.thumbOffsetMs,
+      publishOptions: existing.publishOptions,
       format: existing.format,
       status: 'draft',
       timezone: existing.timezone,
@@ -1386,6 +1414,7 @@ api.post('/content/:id/repost', requireSession, async (req, res) => {
       videoVolume: existing.videoVolume,
       coverMediaId: existing.coverMediaId,
       thumbOffsetMs: existing.thumbOffsetMs,
+      publishOptions: existing.publishOptions,
       format: existing.format,
       status: 'draft',
       timezone: existing.timezone,
