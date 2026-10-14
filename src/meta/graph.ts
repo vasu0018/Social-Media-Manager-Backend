@@ -150,7 +150,9 @@ function scopesFor(purpose: 'instagram' | 'facebook', includeComments: boolean) 
     if (includeComments) scopes.push('instagram_business_manage_comments')
     return scopes
   }
-  return ['pages_show_list', 'pages_read_engagement', 'pages_manage_posts', 'instagram_basic', 'instagram_content_publish', 'business_management']
+  const scopes = ['pages_show_list', 'pages_read_engagement', 'pages_manage_posts', 'instagram_basic', 'instagram_content_publish', 'business_management']
+  if (env.META_ADS_MUSIC) scopes.push('ads_management')
+  return scopes
 }
 
 function expiryDate(epoch?: number) {
@@ -740,12 +742,18 @@ export type AudioPage = {
   hasMore: boolean
 }
 
+export type AudioSource = 'instagram' | 'ads'
+
 export type AudioRequest = {
   audioType?: 'music' | 'original_sound'
+  // 'ads' asks Meta for its ads music library (product=ADS), which needs the ads_management permission.
+  source?: AudioSource
   searchQuery?: string | null
   cursor?: string | null
   limit?: number
 }
+
+export const adsMusicPermissionMessage = 'Ads music needs the "ads_management" permission. Add it to the Meta app, then connect the Facebook Page again and allow it.'
 
 const audioFields = 'audio_id,title,display_artist,ig_username,duration_in_ms,download_url,cover_artwork_thumbnail_uri,cover_artwork_thumbnail_url,profile_picture_url'
 // Meta answers with at most about 50 songs per page, and search never returns more than one page.
@@ -756,8 +764,9 @@ function audioSearch(query: string | null | undefined) {
   return search.length >= 2 ? search : null
 }
 
-function audioFailure(error: unknown, cursor: string | null | undefined): never {
+function audioFailure(error: unknown, cursor: string | null | undefined, source: AudioSource): never {
   if (!(error instanceof HttpError)) throw error
+  if (source === 'ads' && /ads_management/i.test(error.message)) throw new HttpError(403, adsMusicPermissionMessage, 'ads_permission')
   if (error.status === 429) throw new HttpError(429, 'Instagram is limiting song lookups right now. Wait a minute, then try again.', error.code)
   if (error.status === 401) throw new HttpError(401, 'The Facebook Page connection for songs expired. Connect the Page again on Social Accounts.', error.code)
   if (cursor && error.status === 400) throw new HttpError(400, 'The song list changed on Instagram. Search again to start from the top.', error.code)
@@ -776,13 +785,14 @@ export async function fetchInstagramAudio(token: string, igUserId: string, reque
   })
   if (search) params.set('search_query', search)
   if (request.cursor) params.set('after', request.cursor)
-  let result: { audio?: Array<Record<string, unknown>>; paging?: { cursors?: { after?: string } } }
+  if (request.source === 'ads') params.set('product', 'ADS')
+  let result: { audio?: Array<Record<string, unknown>>; data?: Array<Record<string, unknown>>; paging?: { cursors?: { after?: string } } }
   try {
     result = await graph(`/ig_audio?${params.toString()}`, token)
   } catch (error) {
-    audioFailure(error, request.cursor)
+    audioFailure(error, request.cursor, request.source ?? 'instagram')
   }
-  const batch = result.audio ?? []
+  const batch = result.audio ?? result.data ?? []
   const songs = batch.map((item) => mapAudio(item, audioType)).filter((track): track is InstagramAudio => track !== null)
   const after = result.paging?.cursors?.after ?? null
   const nextCursor = after && after !== request.cursor && batch.length > 0 ? after : null

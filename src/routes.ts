@@ -924,27 +924,39 @@ api.get('/audio', requireSession, async (req, res) => {
   const type = 'music'
   const query = typeof req.query.q === 'string' ? req.query.q : ''
   const cursor = typeof req.query.cursor === 'string' && /^[\w+/=-]{1,512}$/.test(req.query.cursor) ? req.query.cursor : null
+  const source = req.query.source === 'ads' && env.META_ADS_MUSIC ? 'ads' : 'instagram'
+  const adsMusic = env.META_ADS_MUSIC
   const account = accountId ? await prisma.socialAccount.findUnique({ where: { id: accountId } }) : null
   if (!account || account.platform !== 'instagram' || !account.connected || !account.tokenCipher) {
     throw new HttpError(400, 'Choose a connected Instagram account before looking up songs.')
   }
+  const empty = { tracks: [], nextCursor: null, hasMore: false, available: false, adsMusic, source }
   const catalog = await catalogAccess(account)
   if (!catalog.token) {
-    return res.json({ tracks: [], nextCursor: null, hasMore: false, available: false, needsPage: true, needsLink: catalog.needsLink, reason: catalog.reason })
+    return res.json({ ...empty, needsPage: true, needsLink: catalog.needsLink, needsAdsPermission: false, reason: catalog.reason })
   }
-  const page = await socialProvider.searchAudio(decryptSecret(catalog.token), account.externalId, {
-    audioType: type,
-    searchQuery: query,
-    cursor,
-    limit: 50,
-    maxPages: 2,
-  })
+  let page
+  try {
+    page = await socialProvider.searchAudio(decryptSecret(catalog.token), account.externalId, {
+      audioType: type,
+      source,
+      searchQuery: query,
+      cursor,
+      limit: 50,
+      maxPages: 2,
+    })
+  } catch (error) {
+    if (error instanceof HttpError && error.code === 'ads_permission') {
+      return res.json({ ...empty, needsPage: false, needsLink: false, needsAdsPermission: true, reason: error.message })
+    }
+    throw error
+  }
   const tracks = page.songs.map((track) => ({
     ...track,
     previewUrl: audioFilePath(track.previewUrl),
     artworkUrl: audioFilePath(track.artworkUrl),
   }))
-  res.json({ tracks, nextCursor: page.nextCursor, hasMore: page.hasMore, available: true, needsPage: false, needsLink: false, reason: null })
+  res.json({ tracks, nextCursor: page.nextCursor, hasMore: page.hasMore, available: true, adsMusic, source, needsPage: false, needsLink: false, needsAdsPermission: false, reason: null })
 })
 
 api.get('/places', requireSession, rateLimit('places', 120, 60 * 60_000), async (req, res) => {

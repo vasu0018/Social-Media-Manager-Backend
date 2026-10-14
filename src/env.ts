@@ -21,6 +21,8 @@ const schema = z.object({
   META_REDIRECT_URI: z.string().default(''),
   INSTAGRAM_APP_ID: z.string().default(''),
   INSTAGRAM_APP_SECRET: z.string().default(''),
+  // Asks Facebook for ads_management so Meta's ads music library can be searched. The permission must be added to the Meta app first.
+  META_ADS_MUSIC: z.string().default('false').transform((value) => value.trim().toLowerCase() === 'true'),
   S3_BUCKET: z.string().default(''),
   S3_REGION: z.string().default('auto'),
   S3_ENDPOINT: z.string().default(''),
