@@ -322,7 +322,9 @@ async function listContent(req: Request, statuses?: string[]) {
 export const api = Router()
 
 api.use(guardRequest)
-api.use(rateLimit('api', 300, 60_000))
+const apiLimit = rateLimit('api', 300, 60_000)
+// Song artwork and previews come through /audio/file, one request per song, so a long song list has its own limit.
+api.use((req, res, next) => (req.path === '/audio/file' ? next() : apiLimit(req, res, next)))
 
 api.get('/health', (_req, res) => {
   res.json({ ok: true })
@@ -889,7 +891,7 @@ function audioFilePath(remote: string | null) {
   return browserPath(`/api/audio/file?exp=${exp}&sig=${sig}&src=${encodeURIComponent(remote)}`)
 }
 
-api.get('/audio/file', async (req, res) => {
+api.get('/audio/file', rateLimit('audio-file', 3000, 60_000), async (req, res) => {
   const exp = Number(req.query.exp)
   const sig = typeof req.query.sig === 'string' ? req.query.sig : ''
   const src = typeof req.query.src === 'string' ? req.query.src : ''
@@ -921,20 +923,28 @@ api.get('/audio', requireSession, async (req, res) => {
   const accountId = typeof req.query.accountId === 'string' ? req.query.accountId : ''
   const type = 'music'
   const query = typeof req.query.q === 'string' ? req.query.q : ''
+  const cursor = typeof req.query.cursor === 'string' && /^[\w+/=-]{1,512}$/.test(req.query.cursor) ? req.query.cursor : null
   const account = accountId ? await prisma.socialAccount.findUnique({ where: { id: accountId } }) : null
   if (!account || account.platform !== 'instagram' || !account.connected || !account.tokenCipher) {
     throw new HttpError(400, 'Choose a connected Instagram account before looking up songs.')
   }
   const catalog = await catalogAccess(account)
   if (!catalog.token) {
-    return res.json({ tracks: [], available: false, needsPage: true, needsLink: catalog.needsLink, reason: catalog.reason })
+    return res.json({ tracks: [], nextCursor: null, hasMore: false, available: false, needsPage: true, needsLink: catalog.needsLink, reason: catalog.reason })
   }
-  const tracks = (await socialProvider.searchAudio(decryptSecret(catalog.token), account.externalId, type, query)).map((track) => ({
+  const page = await socialProvider.searchAudio(decryptSecret(catalog.token), account.externalId, {
+    audioType: type,
+    searchQuery: query,
+    cursor,
+    limit: 50,
+    maxPages: 2,
+  })
+  const tracks = page.songs.map((track) => ({
     ...track,
     previewUrl: audioFilePath(track.previewUrl),
     artworkUrl: audioFilePath(track.artworkUrl),
   }))
-  res.json({ tracks, available: true, needsPage: false, needsLink: false, reason: null })
+  res.json({ tracks, nextCursor: page.nextCursor, hasMore: page.hasMore, available: true, needsPage: false, needsLink: false, reason: null })
 })
 
 api.get('/places', requireSession, rateLimit('places', 120, 60 * 60_000), async (req, res) => {

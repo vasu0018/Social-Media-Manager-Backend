@@ -44,7 +44,7 @@ function version() {
 
 export function classifyMetaError(status: number, message: string, code?: string) {
   if (message.includes('revoked') || message.includes('session has expired')) return new HttpError(401, message, code)
-  if (status === 429 || /request limit|too many calls|temporarily unavailable/i.test(message)) return new HttpError(429, message, code)
+  if (status === 429 || ['4', '17', '32', '613'].includes(code ?? '') || /request limit|rate limit|too many calls|temporarily unavailable/i.test(message)) return new HttpError(429, message, code)
   if (status >= 400 && status < 500) return new HttpError(status, message, code)
   return new HttpError(503, message, code)
 }
@@ -734,32 +734,82 @@ function audioText(value: unknown) {
   return typeof value === 'string' && value.trim() ? value.trim() : null
 }
 
-export async function searchInstagramAudio(token: string, igUserId: string, audioType: 'music' | 'original_sound', query: string): Promise<InstagramAudio[]> {
-  const search = query.trim().slice(0, 80)
-  const collected: InstagramAudio[] = []
-  const seen = new Set<string>()
-  let after = ''
-  for (let page = 0; page < 4; page += 1) {
-    const params = new URLSearchParams({
-      audio_type: audioType,
-      user_id: igUserId,
-      fields: 'audio_id,title,display_artist,ig_username,duration_in_ms,download_url,cover_artwork_thumbnail_uri,cover_artwork_thumbnail_url,profile_picture_url',
-    })
-    if (search.length >= 2) params.set('search_query', search)
-    if (after) params.set('after', after)
-    const result = await graph<{ audio?: Array<Record<string, unknown>>; paging?: { cursors?: { after?: string } } }>(`/ig_audio?${params.toString()}`, token)
-    const batch = result.audio ?? []
-    for (const item of batch) {
-      const track = mapAudio(item, audioType)
-      if (!track || seen.has(track.id)) continue
-      seen.add(track.id)
-      collected.push(track)
-    }
-    const next = result.paging?.cursors?.after ?? ''
-    if (!next || next === after || batch.length === 0) break
-    after = next
+export type AudioPage = {
+  songs: InstagramAudio[]
+  nextCursor: string | null
+  hasMore: boolean
+}
+
+export type AudioRequest = {
+  audioType?: 'music' | 'original_sound'
+  searchQuery?: string | null
+  cursor?: string | null
+  limit?: number
+}
+
+const audioFields = 'audio_id,title,display_artist,ig_username,duration_in_ms,download_url,cover_artwork_thumbnail_uri,cover_artwork_thumbnail_url,profile_picture_url'
+// Meta answers with at most about 50 songs per page, and search never returns more than one page.
+const audioPageLimit = 50
+
+function audioSearch(query: string | null | undefined) {
+  const search = (query ?? '').trim().slice(0, 80)
+  return search.length >= 2 ? search : null
+}
+
+function audioFailure(error: unknown, cursor: string | null | undefined): never {
+  if (!(error instanceof HttpError)) throw error
+  if (error.status === 429) throw new HttpError(429, 'Instagram is limiting song lookups right now. Wait a minute, then try again.', error.code)
+  if (error.status === 401) throw new HttpError(401, 'The Facebook Page connection for songs expired. Connect the Page again on Social Accounts.', error.code)
+  if (cursor && error.status === 400) throw new HttpError(400, 'The song list changed on Instagram. Search again to start from the top.', error.code)
+  throw error
+}
+
+// Meta pages ig_audio with paging.cursors.after only (no paging.next URL); a missing or repeated cursor means the list ended.
+export async function fetchInstagramAudio(token: string, igUserId: string, request: AudioRequest = {}): Promise<AudioPage> {
+  const audioType = request.audioType ?? 'music'
+  const search = audioSearch(request.searchQuery)
+  const params = new URLSearchParams({
+    audio_type: audioType,
+    user_id: igUserId,
+    fields: audioFields,
+    limit: String(Math.min(Math.max(Math.round(request.limit ?? 25), 1), audioPageLimit)),
+  })
+  if (search) params.set('search_query', search)
+  if (request.cursor) params.set('after', request.cursor)
+  let result: { audio?: Array<Record<string, unknown>>; paging?: { cursors?: { after?: string } } }
+  try {
+    result = await graph(`/ig_audio?${params.toString()}`, token)
+  } catch (error) {
+    audioFailure(error, request.cursor)
   }
-  return search.length >= 2 ? rankAudio(collected, search) : collected
+  const batch = result.audio ?? []
+  const songs = batch.map((item) => mapAudio(item, audioType)).filter((track): track is InstagramAudio => track !== null)
+  const after = result.paging?.cursors?.after ?? null
+  const nextCursor = after && after !== request.cursor && batch.length > 0 ? after : null
+  return { songs: search ? rankAudio(songs, search) : songs, nextCursor, hasMore: nextCursor !== null }
+}
+
+// Loads several pages in a row, skipping songs Meta repeats across pages, and pauses between calls to stay under rate limits.
+export async function fetchInstagramAudioPages(
+  token: string,
+  igUserId: string,
+  request: AudioRequest & { maxPages?: number; delayMs?: number } = {},
+): Promise<AudioPage> {
+  const maxPages = Math.min(Math.max(request.maxPages ?? 3, 1), 5)
+  const delayMs = request.delayMs ?? 250
+  const seen = new Set<string>()
+  const songs: InstagramAudio[] = []
+  let cursor = request.cursor ?? null
+  for (let page = 0; page < maxPages; page += 1) {
+    if (page > 0) await sleep(delayMs)
+    const result = await fetchInstagramAudio(token, igUserId, { ...request, cursor })
+    const fresh = result.songs.filter((song) => !seen.has(song.id))
+    for (const song of fresh) seen.add(song.id)
+    songs.push(...fresh)
+    cursor = fresh.length > 0 ? result.nextCursor : null
+    if (!cursor) break
+  }
+  return { songs, nextCursor: cursor, hasMore: cursor !== null }
 }
 
 function mapAudio(item: Record<string, unknown>, audioType: 'music' | 'original_sound'): InstagramAudio | null {
@@ -920,7 +970,7 @@ export const metaProvider = {
   publish(input: PublishInput): Promise<{ externalId: string; warning?: string }> {
     return input.format.startsWith('instagram') ? publishInstagram(input) : publishFacebook(input)
   },
-  searchAudio(token: string, igUserId: string, audioType: 'music' | 'original_sound', query: string) {
-    return searchInstagramAudio(token, igUserId, audioType, query)
+  searchAudio(token: string, igUserId: string, request: AudioRequest & { maxPages?: number }) {
+    return fetchInstagramAudioPages(token, igUserId, request)
   },
 }

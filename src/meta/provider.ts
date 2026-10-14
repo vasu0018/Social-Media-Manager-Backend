@@ -1,4 +1,4 @@
-import type { DiscoveredAccount, InstagramAudio, PublishInput } from './graph.js'
+import type { AudioPage, AudioRequest, DiscoveredAccount, PublishInput } from './graph.js'
 
 export type SocialProvider = {
   apiVersion: string
@@ -13,7 +13,7 @@ export type SocialProvider = {
     accountType?: string | null
   }>
   publish: (input: PublishInput) => Promise<{ externalId: string; warning?: string }>
-  searchAudio: (token: string, igUserId: string, audioType: 'music' | 'original_sound', query: string) => Promise<InstagramAudio[]>
+  searchAudio: (token: string, igUserId: string, request: AudioRequest & { maxPages?: number }) => Promise<AudioPage>
 }
 
 export { metaProvider as socialProvider } from './graph.js'
