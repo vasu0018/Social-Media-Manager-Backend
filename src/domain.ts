@@ -67,12 +67,8 @@ export const mediaRules: Record<ContentFormat, MediaRule> = {
     kinds: ['image'],
     // Upload accepts these; non-JPEG files are converted to JPEG before save because Instagram requires JPEG.
     mimes: ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/bmp'],
-    maxBytes: mb(8),
-    minWidth: 320,
-    maxWidth: 1440,
-    minAspect: 0.8,
-    maxAspect: 1.91,
-    note: 'JPEG, PNG, WebP, GIF, or BMP, up to 8 MB. Aspect ratio must be between 4:5 and 1.91:1.',
+    maxBytes: mb(300),
+    note: 'JPEG, PNG, WebP, GIF, or BMP. Size and aspect are not blocked on upload.',
   },
   instagram_reel: {
     label: 'Instagram Reel',
@@ -102,20 +98,18 @@ export const mediaRules: Record<ContentFormat, MediaRule> = {
     label: 'Instagram Story',
     kinds: ['image', 'video'],
     mimes: ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/bmp', 'video/mp4', 'video/quicktime'],
-    maxBytes: mb(100),
+    maxBytes: mb(300),
     minDurationMs: 3000,
     maxDurationMs: 60_000,
-    maxWidth: 1920,
-    note: 'Stories publish only to Instagram Business accounts. Photos can be JPEG, PNG, WebP, or GIF. Video is 3 to 60 seconds. 9:16 is recommended.',
+    note: 'Stories publish only to Instagram Business accounts. Photos can be JPEG, PNG, WebP, GIF, or BMP. Video is 3 to 60 seconds.',
   },
   facebook_image: {
     label: 'Facebook image post',
     kinds: ['image'],
     // Upload accepts these; WebP/GIF/BMP are converted to JPEG. JPEG and PNG stay as uploaded.
     mimes: ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/bmp'],
-    maxBytes: mb(10),
-    minWidth: 320,
-    note: 'JPEG, PNG, WebP, GIF, or BMP, up to 10 MB.',
+    maxBytes: mb(300),
+    note: 'JPEG, PNG, WebP, GIF, or BMP. Size and aspect are not blocked on upload.',
   },
   facebook_video: {
     label: 'Facebook video post',
@@ -143,14 +137,15 @@ export const mediaRules: Record<ContentFormat, MediaRule> = {
     label: 'Facebook Story',
     kinds: ['image', 'video'],
     mimes: ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/bmp', 'video/mp4', 'video/quicktime'],
-    maxBytes: mb(100),
+    maxBytes: mb(300),
     minDurationMs: 3000,
     maxDurationMs: 60_000,
+    // Video stories still prefer 9:16; photo stories are not blocked by size or aspect on upload.
     minWidth: 540,
     minHeight: 960,
     aspectTarget: 9 / 16,
     aspectTolerance: 0.06,
-    note: '9:16 photo or video. Video stories are 3 to 60 seconds and at least 540×960.',
+    note: 'Photo or video. Video stories are 3 to 60 seconds.',
   },
 }
 
@@ -163,33 +158,35 @@ export function validateProbe(format: ContentFormat, probe: Probe) {
   if (!rule.mimes.includes(probe.mime)) {
     errors.push(`${rule.label} accepts ${rule.mimes.join(', ')}.`)
   }
-  const imageCap = format.startsWith('instagram') && probe.kind === 'image' ? 8 * 1024 * 1024 : rule.maxBytes
-  if (probe.bytes > imageCap) {
-    errors.push(`${rule.label} must be ${Math.round(imageCap / (1024 * 1024))} MB or smaller.`)
+  // Photos for posts/stories: do not block on file size, width, height, or aspect ratio.
+  // Only the hard upload ceiling (multer 300 MB) applies. Meta may still refuse at publish time.
+  if (probe.kind === 'image') {
+    if (probe.bytes > mb(300)) errors.push(`${rule.label} must be 300 MB or smaller.`)
+    return errors
   }
-  if (probe.kind === 'video') {
-    if (probe.durationMs == null) errors.push('The video duration could not be read. Export a standard MP4 and try again.')
-    else {
-      if (rule.minDurationMs && probe.durationMs < rule.minDurationMs) {
-        errors.push(`${rule.label} must be at least ${rule.minDurationMs / 1000} seconds.`)
-      }
-      if (rule.maxDurationMs && probe.durationMs > rule.maxDurationMs) {
-        errors.push(`${rule.label} must be ${rule.maxDurationMs / 1000} seconds or shorter.`)
-      }
+  if (probe.bytes > rule.maxBytes) {
+    errors.push(`${rule.label} must be ${Math.round(rule.maxBytes / (1024 * 1024))} MB or smaller.`)
+  }
+  if (probe.durationMs == null) errors.push('The video duration could not be read. Export a standard MP4 and try again.')
+  else {
+    if (rule.minDurationMs && probe.durationMs < rule.minDurationMs) {
+      errors.push(`${rule.label} must be at least ${rule.minDurationMs / 1000} seconds.`)
+    }
+    if (rule.maxDurationMs && probe.durationMs > rule.maxDurationMs) {
+      errors.push(`${rule.label} must be ${rule.maxDurationMs / 1000} seconds or shorter.`)
     }
   }
   if (probe.width != null && probe.height != null && probe.height > 0) {
     const aspect = probe.width / probe.height
-    const sizeFloor = !(format === 'facebook_story' && probe.kind === 'image')
-    if (sizeFloor && rule.minWidth && probe.width < rule.minWidth) errors.push(`Width must be at least ${rule.minWidth} pixels.`)
+    if (rule.minWidth && probe.width < rule.minWidth) errors.push(`Width must be at least ${rule.minWidth} pixels.`)
     if (rule.maxWidth && probe.width > rule.maxWidth) errors.push(`Width must be ${rule.maxWidth} pixels or less.`)
-    if (sizeFloor && rule.minHeight && probe.height < rule.minHeight) errors.push(`Height must be at least ${rule.minHeight} pixels.`)
+    if (rule.minHeight && probe.height < rule.minHeight) errors.push(`Height must be at least ${rule.minHeight} pixels.`)
     if (rule.minAspect && aspect < rule.minAspect - 0.01) errors.push('The aspect ratio is taller than this format allows.')
     if (rule.maxAspect && aspect > rule.maxAspect + 0.01) errors.push('The aspect ratio is wider than this format allows.')
     if (rule.aspectTarget && rule.aspectTolerance && Math.abs(aspect - rule.aspectTarget) > rule.aspectTolerance) {
       errors.push(`${rule.label} needs a 9:16 frame.`)
     }
-  } else if (probe.kind === 'image' || format === 'facebook_reel' || format === 'facebook_story') {
+  } else if (format === 'facebook_reel' || format === 'facebook_story') {
     errors.push('The file dimensions could not be read.')
   }
   return errors
