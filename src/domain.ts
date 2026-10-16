@@ -65,13 +65,14 @@ export const mediaRules: Record<ContentFormat, MediaRule> = {
   instagram_feed_image: {
     label: 'Instagram feed image',
     kinds: ['image'],
-    mimes: ['image/jpeg'],
+    // Upload accepts these; non-JPEG files are converted to JPEG before save because Instagram requires JPEG.
+    mimes: ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/bmp'],
     maxBytes: mb(8),
     minWidth: 320,
     maxWidth: 1440,
     minAspect: 0.8,
     maxAspect: 1.91,
-    note: 'JPEG only. Aspect ratio must be between 4:5 and 1.91:1.',
+    note: 'JPEG, PNG, WebP, GIF, or BMP, up to 8 MB. Aspect ratio must be between 4:5 and 1.91:1.',
   },
   instagram_reel: {
     label: 'Instagram Reel',
@@ -110,10 +111,11 @@ export const mediaRules: Record<ContentFormat, MediaRule> = {
   facebook_image: {
     label: 'Facebook image post',
     kinds: ['image'],
-    mimes: ['image/jpeg', 'image/png'],
+    // Upload accepts these; WebP/GIF/BMP are converted to JPEG. JPEG and PNG stay as uploaded.
+    mimes: ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/bmp'],
     maxBytes: mb(10),
     minWidth: 320,
-    note: 'JPEG or PNG, up to 10 MB.',
+    note: 'JPEG, PNG, WebP, GIF, or BMP, up to 10 MB.',
   },
   facebook_video: {
     label: 'Facebook video post',

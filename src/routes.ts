@@ -661,15 +661,31 @@ api.post(['/media', '/media/upload'], requireSession, rateLimit('upload', 40, 60
     : null
   const incomingVideo = file.mimetype.startsWith('video/') || /\.(mp4|mov)$/i.test(file.originalname)
   const incomingImage = file.mimetype.startsWith('image/') || /\.(jpe?g|png|webp|gif|bmp)$/i.test(file.originalname)
+  const imageMime = incomingImage
+    ? (file.mimetype.startsWith('image/')
+      ? file.mimetype
+      : /\.png$/i.test(file.originalname) ? 'image/png'
+        : /\.webp$/i.test(file.originalname) ? 'image/webp'
+          : /\.gif$/i.test(file.originalname) ? 'image/gif'
+            : /\.bmp$/i.test(file.originalname) ? 'image/bmp'
+              : 'image/jpeg')
+    : file.mimetype
+  // Instagram feed and Stories need JPEG. Facebook photos keep JPEG/PNG; other image types become JPEG.
+  const convertImage = incomingImage && (
+    format === 'instagram_feed_image'
+    || format?.endsWith('story')
+    || (format === 'facebook_image' && imageMime !== 'image/jpeg' && imageMime !== 'image/png')
+    || (!format && imageMime !== 'image/jpeg' && imageMime !== 'image/png')
+  )
   let body = file.buffer
-  let mime = file.mimetype
+  let mime = incomingImage ? imageMime : file.mimetype
   let name = file.originalname
   if (incomingVideo) {
     body = (await prepareVideo(file.buffer)).body
     mime = 'video/mp4'
     name = file.originalname.replace(/\.mov$/i, '.mp4')
-  } else if (incomingImage && (format?.endsWith('story') || (file.mimetype !== 'image/jpeg' && file.mimetype !== 'image/png'))) {
-    const prepared = await prepareStoryImage(file.buffer, file.mimetype || 'image/jpeg')
+  } else if (convertImage) {
+    const prepared = await prepareStoryImage(file.buffer, imageMime)
     body = prepared.body
     mime = prepared.mime
     name = file.originalname.replace(/\.[^.]+$/, '.jpg')
