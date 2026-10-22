@@ -220,6 +220,16 @@ export async function deliver(publicationId: string) {
     await publishClaimed(existing)
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Publishing failed before Meta accepted the content.'
+    if (/reconnect the account|access expired or was revoked/i.test(message)) {
+      await prisma.socialAccount.update({
+        where: { id: existing.accountId },
+        data: {
+          tokenStatus: 'revoked',
+          eligible: false,
+          eligibilityReason: 'Reconnect this account. Access expired or was revoked.',
+        },
+      }).catch(() => undefined)
+    }
     const retryable = !isPermanent(error)
     const errorCode = error instanceof HttpError ? error.code ?? String(error.status) : 'publish_failed'
     await prisma.publishingAttempt.create({
@@ -314,8 +324,10 @@ async function publishClaimed(existing: Loaded) {
   if (!account.tokenCipher) throw new PermanentPublishError(400, 'Reconnect this account before publishing.')
   const { decryptSecret } = await import('./crypto.js')
   const tasks = taskList(account.tasks)
-  const catalogToken = songOnInstagram ? pageTokenCipher(account) : null
-  if (songOnInstagram && !catalogToken) {
+  // A Facebook Page token must be sent to graph.facebook.com. Keeping an older Instagram-login token and
+  // posting it there makes Meta return "connection revoked" on every story, so the post looks partial.
+  const pageToken = account.platform === 'instagram' ? pageTokenCipher(account) : null
+  if (songOnInstagram && !pageToken) {
     throw new PermanentPublishError(400, 'Connect the Facebook Page that owns this Instagram account before publishing a Reel with a song.')
   }
   const result = await socialProvider.publish({
@@ -323,10 +335,10 @@ async function publishClaimed(existing: Loaded) {
     caption: content.caption,
     hashtags: content.hashtags,
     firstComment: content.firstComment,
-    token: decryptSecret(catalogToken ?? account.tokenCipher),
+    token: decryptSecret(pageToken ?? account.tokenCipher),
     pageId: account.pageId,
     igId: account.platform === 'instagram' ? account.externalId : null,
-    instagramLogin: tasks.includes('INSTAGRAM_LOGIN') && !tasks.includes('FACEBOOK_LOGIN') && !catalogToken,
+    instagramLogin: account.platform === 'instagram' && !pageToken && tasks.includes('INSTAGRAM_LOGIN'),
     kind: content.media.kind as 'image' | 'video',
     mime: content.media.mime,
     bytes,

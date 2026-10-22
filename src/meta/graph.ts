@@ -504,11 +504,19 @@ async function publishInstagram(input: PublishInput) {
     await sleep(15000)
     containerId = await createContainer()
   }
-  const published = await graph<{ id: string }>(`/${input.igId}/media_publish`, input.token, {
+  const publishContainer = () => graph<{ id: string }>(`/${input.igId}/media_publish`, input.token, {
     method: 'POST',
     body: form({ creation_id: containerId }),
     host,
   })
+  let published: { id: string }
+  try {
+    published = await publishContainer()
+  } catch (error) {
+    if (!(error instanceof HttpError) || !/not ready|cannot be found/i.test(error.message)) throw error
+    await sleep(8000)
+    published = await publishContainer()
+  }
   if (input.firstComment && input.format !== 'instagram_story') {
     try {
       await graph(`/${published.id}/comments`, input.token, { method: 'POST', body: form({ message: input.firstComment }), host })
